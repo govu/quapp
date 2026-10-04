@@ -4,8 +4,8 @@ import {
   Bell, ChatCircle, Database, Info, Keyboard, Lock, PaintBrush, User, X,
 } from '@phosphor-icons/react'
 import { cx, spring } from '../lib/util'
-import { setSettingsOpen, updateSettings, useStore, type Accent } from '../store'
-import { Avatar, SquircleIcon } from './common'
+import { logout, setSettingsOpen, updateSettings, useStore, type Accent } from '../store'
+import { Avatar, Dialog, DialogButton, SquircleIcon } from './common'
 
 type SectionId = 'account' | 'appearance' | 'chats' | 'notifications' | 'privacy' | 'storage' | 'shortcuts' | 'about'
 
@@ -165,12 +165,15 @@ function Segmented<T extends string>({ options, value, onChange }: { options: { 
 
 function AccountSection() {
   const account = useStore((s) => s.account)
+  const demoMode = useStore((s) => s.demoMode)
+  const [dialog, setDialog] = useState<'devices' | 'add' | 'logout' | null>(null)
+  const relink = () => { setDialog(null); logout() }
   return (
     <div>
       <SectionTitle>Account</SectionTitle>
       <Group>
         <div className="flex items-center gap-3.5 py-1">
-          <Avatar name={account?.name ?? 'You'} hue={account?.avatarHue ?? 210} size={56} />
+          <Avatar name={account?.name ?? 'You'} hue={account?.avatarHue ?? 210} url={account?.avatarUrl} size={56} />
           <div>
             <div className="text-[16px] font-semibold">{account?.name}</div>
             <div className="text-[13px] text-[var(--label-2)]">{account?.phone}</div>
@@ -178,12 +181,49 @@ function AccountSection() {
         </div>
       </Group>
       <Group>
-        <Row label="Linked devices" hint="1 device connected" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
-        <Row label="Add account" hint="Link another phone number" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
+        <button className="block w-full text-left" onClick={() => setDialog('devices')}>
+          <Row label="Linked devices" hint="This device" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
+        </button>
+        <button className="block w-full text-left" onClick={() => setDialog('add')}>
+          <Row label="Link a different account" hint="Replaces the session on this device" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
+        </button>
       </Group>
       <Group>
-        <Row label="Log out" hint="Unlink this device. Your messages stay on this Mac." control={<button className="press rounded-[7px] px-2.5 py-1 text-[13px] font-medium text-[var(--red)] hover:bg-[var(--red)]/10">Log out</button>} />
+        <Row label="Log out" hint="Unlink this device. Your messages stay on this PC." control={<button onClick={() => setDialog('logout')} className="press rounded-[7px] px-2.5 py-1 text-[13px] font-medium text-[var(--red)] hover:bg-[var(--red)]/10">Log out</button>} />
       </Group>
+
+      <Dialog open={dialog === 'devices'} onClose={() => setDialog(null)} title="Linked devices"
+        actions={<>
+          <DialogButton destructive onClick={relink}>Unlink this device</DialogButton>
+          <DialogButton onClick={() => setDialog(null)}>Cancel</DialogButton>
+        </>}>
+        <div className="text-left">
+          <div className="mb-1 flex items-center gap-2.5 rounded-[9px] bg-[var(--fill-3)] px-3 py-2.5">
+            <span className="grid size-7 place-items-center rounded-[7px] bg-[var(--blue)]/15 text-[var(--blue)]">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium">Quapp — Windows</div>
+              <div className="text-[11.5px] text-[var(--label-3)]">{demoMode ? 'Demo session' : 'This device · active now'}</div>
+            </div>
+          </div>
+          Manage other sessions from WhatsApp on your phone → Linked devices.
+        </div>
+      </Dialog>
+      <Dialog open={dialog === 'add'} onClose={() => setDialog(null)} title="Link a different account?"
+        actions={<>
+          <DialogButton primary onClick={relink}>Show QR</DialogButton>
+          <DialogButton onClick={() => setDialog(null)}>Cancel</DialogButton>
+        </>}>
+        You'll be signed out of {account?.phone ?? 'this number'} and shown a QR code to link a different WhatsApp account.
+      </Dialog>
+      <Dialog open={dialog === 'logout'} onClose={() => setDialog(null)} title="Log out of Quapp?"
+        actions={<>
+          <DialogButton destructive onClick={relink}>Log out</DialogButton>
+          <DialogButton onClick={() => setDialog(null)}>Cancel</DialogButton>
+        </>}>
+        This unlinks the device from {account?.phone ?? 'your WhatsApp'}. Your messages stay on this PC.
+      </Dialog>
     </div>
   )
 }
@@ -273,7 +313,7 @@ function ChatsSection() {
     <div>
       <SectionTitle>Chats</SectionTitle>
       <Group>
-        <Row label="Enter sends message" hint="Off: Enter adds a line, ⌘Enter sends" control={<Toggle on={settings.enterToSend} onChange={(v) => updateSettings({ enterToSend: v })} />} />
+        <Row label="Enter sends message" hint="Off: Enter adds a line, Ctrl+Enter sends" control={<Toggle on={settings.enterToSend} onChange={(v) => updateSettings({ enterToSend: v })} />} />
         <Row label="Link previews" hint="Show a preview card for links" control={<Toggle on={settings.linkPreviews} onChange={(v) => updateSettings({ linkPreviews: v })} />} />
         <Row label="Animations" hint="Reduce motion for a calmer interface" control={
           <Segmented
@@ -386,14 +426,14 @@ function StorageSection() {
 }
 
 const SHORTCUTS: [string, string][] = [
-  ['Command palette', '⌘K'],
-  ['Search in chat', '⌘F'],
-  ['Settings', '⌘,'],
-  ['Next / previous chat', '⌥↑ ⌥↓'],
+  ['Command palette', 'Ctrl+K'],
+  ['Search in chat', 'Ctrl+F'],
+  ['Settings', 'Ctrl+,'],
+  ['Next / previous chat', 'Alt+↑ Alt+↓'],
   ['Edit last message', '↑ (empty composer)'],
-  ['Bold / italic / code', '⌘B ⌘I ⌘E'],
-  ['Strikethrough', '⇧⌘X'],
-  ['New line', '⇧Enter'],
+  ['Bold / italic / code', 'Ctrl+B Ctrl+I Ctrl+E'],
+  ['Strikethrough', 'Ctrl+Shift+X'],
+  ['New line', 'Shift+Enter'],
   ['Close / cancel', 'Esc'],
 ]
 

@@ -79,8 +79,8 @@ export const Palette = memo(function Palette() {
         run: () => updateSettings({ theme: theme === 'dark' ? 'light' : 'dark' }),
       },
       { name: 'Mark all as read', icon: <Checks size={17} />, run: markAllRead },
-      { name: 'Search in this chat', icon: <MagnifyingGlass size={17} />, kbd: '⌘F', run: () => setPane('search') },
-      { name: 'Open settings', icon: <Gear size={17} />, kbd: '⌘,', run: () => setSettingsOpen(true) },
+      { name: 'Search in this chat', icon: <MagnifyingGlass size={17} />, kbd: 'Ctrl+F', run: () => setPane('search') },
+      { name: 'Open settings', icon: <Gear size={17} />, kbd: 'Ctrl+,', run: () => setSettingsOpen(true) },
       { name: 'Close active chat', icon: <CircleHalf size={17} />, run: closeChat },
     ]
     for (const a of actions) {

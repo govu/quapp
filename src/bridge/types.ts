@@ -167,6 +167,8 @@ export interface ClientAdapter {
   setTyping(chatId: Id, typing: boolean): void
   setChatFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', value: boolean): void
   vote(chatId: Id, messageId: Id, optionIndexes: number[]): void
+  /** unlink this device — the bridge wipes its session and emits a fresh QR */
+  logout(): void
   onEvent(cb: (e: ServerEvent) => void): () => void
   dispose(): void
 }

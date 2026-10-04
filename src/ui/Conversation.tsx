@@ -184,7 +184,7 @@ function EmptyState() {
         </div>
         <div className="mt-5 text-[22px] font-semibold tracking-[-0.01em]">Quapp</div>
         <div className="mt-1 max-w-[280px] text-[14px] leading-[19px] text-[var(--label-2)]">
-          Pick a conversation, or press <b>⌘K</b> to search.
+          Pick a conversation, or press <b>Ctrl+K</b> to search.
         </div>
       </div>
     </div>

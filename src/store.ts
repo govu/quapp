@@ -62,6 +62,8 @@ interface State {
   qrString: string | null
   bridgeStatus: 'idle' | 'connecting' | 'ready' | 'error'
   demoMode: boolean
+  /** confirm sheet: link a different account (replaces current session) */
+  relinkPrompt: boolean
 }
 
 let toastId = 0
@@ -123,6 +125,7 @@ export const useStore = create<State>(() => ({
   qrString: null,
   bridgeStatus: 'idle',
   demoMode: true,
+  relinkPrompt: false,
   settings: loadSettings(),
 }))
 
@@ -235,9 +238,16 @@ function applyEvent(e: ServerEvent) {
     }
     case 'linked': {
       set({ account: e.account, qrString: null })
+      // after a relink (logout → fresh QR → scan) nothing else asks for the
+      // snapshot — re-boot so history lands and phase flips to 'ready'
+      if (get().phase === 'linking') retryBoot()
       break
     }
     case 'qr': {
+      // a QR while we're in the app means the phone unlinked us remotely
+      if (get().phase === 'ready') {
+        patch({ phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(), activeChat: null })
+      }
       set({ qrString: e.qr })
       break
     }
@@ -246,6 +256,9 @@ function applyEvent(e: ServerEvent) {
         set({ bridgeStatus: 'connecting' })
         // bridge may just be restarting — re-boot automatically while still linking
         if (get().phase === 'linking') setTimeout(retryBoot, 2500)
+      } else if (e.state === 'open' && get().phase === 'ready' && !get().demoMode) {
+        // ws reconnected after a daemon restart — refresh the snapshot
+        retryBoot()
       }
       break
     }
@@ -256,12 +269,15 @@ function applyEvent(e: ServerEvent) {
 // ---------- public actions ----------
 
 let booting = false
+let offEvents: (() => void) | null = null
 
 export async function boot(adapter: ClientAdapter) {
   if (booting) return
   booting = true
   patch({ adapter, bridgeStatus: 'connecting', demoMode: !!adapter.isDemo })
+  offEvents?.() // re-boots (daemon restart) must not double-subscribe events
   const off = adapter.onEvent(applyEvent)
+  offEvents = off
   let snap
   try {
     snap = await adapter.connect()
@@ -283,7 +299,8 @@ export async function boot(adapter: ClientAdapter) {
   }
   const contacts = new Map(snap.contacts.map((c) => [c.id, c]))
   const order = sortChats(chats)
-  const first = order[0] ?? null
+  const current = get().activeChat
+  const first = current && chats.has(current) ? current : (order[0] ?? null)
   patch({
     phase: 'ready', account: snap.account, chats, order, buckets, contacts,
     activeChat: first, bridgeStatus: 'ready', qrString: null,
@@ -296,6 +313,17 @@ export async function boot(adapter: ClientAdapter) {
 export function retryBoot() {
   const { adapter } = get()
   if (adapter) void boot(adapter)
+}
+
+/** unlink this device: daemon wipes the session and pushes a fresh QR */
+export function logout() {
+  const { adapter } = get()
+  patch({
+    phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(),
+    contacts: new Map(), activeChat: null, qrString: null, bridgeStatus: 'connecting',
+    selection: null, replyTo: null, editing: null, settingsOpen: false,
+  })
+  adapter?.logout()
 }
 
 export function openChat(chatId: Id) {
@@ -347,6 +375,7 @@ export function setQuery(q: string) { patch({ query: q }) }
 export function setFilter(f: Filter) { patch({ filter: f, showArchived: false }) }
 export function setShowArchived(v: boolean) { patch({ showArchived: v }) }
 export function setSettingsOpen(v: boolean) { patch({ settingsOpen: v }) }
+export function setRelinkPrompt(v: boolean) { patch({ relinkPrompt: v }) }
 export function setForwarding(msgs: Message[] | null) { patch({ forwarding: msgs }) }
 export function updateSettings(p: Partial<Settings>) {
   set((s) => ({ settings: { ...s.settings, ...p } }))

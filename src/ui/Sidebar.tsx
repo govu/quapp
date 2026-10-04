@@ -8,8 +8,8 @@ import {
 import type { Chat, Id } from '../bridge/types'
 import { cx, highlight, listTime } from '../lib/util'
 import {
-  doFlag, doMarkUnread, openChat, setFilter, setPalette, setQuery, setSettingsOpen,
-  setShowArchived, useStore, type Filter,
+  doFlag, doMarkUnread, openChat, setFilter, setPalette, setQuery, setRelinkPrompt,
+  setSettingsOpen, setShowArchived, useStore, type Filter,
 } from '../store'
 import { Avatar } from './common'
 import { showContextMenu } from './Menu'
@@ -222,7 +222,10 @@ export function Sidebar() {
                     </div>
                     <Check size={16} weight="bold" className="ml-auto text-[var(--blue)]" />
                   </div>
-                  <button className="press mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]">
+                  <button
+                    className="press mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]"
+                    onClick={() => { setAccountOpen(false); setRelinkPrompt(true) }}
+                  >
                     <span className="grid size-[26px] place-items-center rounded-full bg-[var(--fill)]"><Plus size={15} /></span>
                     Add account
                   </button>
@@ -265,7 +268,7 @@ export function Sidebar() {
               <X size={14} weight="bold" />
             </button>
           )}
-          <kbd className="hidden shrink-0 text-[11px] text-[var(--label-3)] md:block">⌘K</kbd>
+          <kbd className="hidden shrink-0 text-[11px] text-[var(--label-3)] md:block">Ctrl+K</kbd>
         </div>
       </div>
 

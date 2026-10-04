@@ -186,7 +186,7 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
     requestAnimationFrame(() => taRef.current?.focus())
   }
 
-  /** wrap the current selection in a markup pair — ⌘B ⌘I ⌘E ⇧⌘X */
+  /** wrap the current selection in a markup pair — Ctrl+B Ctrl+I Ctrl+E Ctrl+Shift+X */
   const wrapSelection = (marker: string) => {
     const ta = taRef.current
     if (!ta) return

@@ -342,23 +342,24 @@ async function ensureSocket() {
       printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
       syncFullHistory: true,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
       shouldSyncHistoryMessage: () => true,
       shouldIgnoreJid: (jid) => isJidBroadcast(jid),
     })
     S.sock = sock
+    const safe = (fn) => (...a) => { try { fn(...a) } catch (e) { log('event handler failed:', e?.message) } }
     sock.ev.on('creds.update', S.authState.saveCreds)
-    sock.ev.on('connection.update', onConn)
-    sock.ev.on('messaging-history.set', onHistory)
-    sock.ev.on('chats.upsert', (chats) => { for (const c of chats) { const m = upsertChat(c); if (m && S.historyDone) emit({ type: 'chat_update', chat: m }) } })
-    sock.ev.on('chats.update', onChatsUpdate)
-    sock.ev.on('contacts.upsert', (cs) => { for (const c of cs) upsertContact(c) })
-    sock.ev.on('contacts.update', (cs) => { for (const c of cs) upsertContact(c) })
-    sock.ev.on('messages.upsert', onMessages)
-    sock.ev.on('messages.update', onMessagesUpdate)
-    sock.ev.on('messages.delete', onMessagesDelete)
-    sock.ev.on('presence.update', onPresence)
+    sock.ev.on('connection.update', safe(onConn))
+    sock.ev.on('messaging-history.set', safe(onHistory))
+    sock.ev.on('chats.upsert', safe((chats) => { for (const c of chats) { const m = upsertChat(c); if (m && S.historyDone) emit({ type: 'chat_update', chat: m }) } }))
+    sock.ev.on('chats.update', safe(onChatsUpdate))
+    sock.ev.on('contacts.upsert', safe((cs) => { for (const c of cs) upsertContact(c) }))
+    sock.ev.on('contacts.update', safe((cs) => { for (const c of cs) upsertContact(c) }))
+    sock.ev.on('messages.upsert', safe(onMessages))
+    sock.ev.on('messages.update', safe(onMessagesUpdate))
+    sock.ev.on('messages.delete', safe(onMessagesDelete))
+    sock.ev.on('presence.update', safe(onPresence))
     log('socket started, protocol', version.join('.'))
   } catch (e) {
     S.sock = null
@@ -380,6 +381,21 @@ function onConn({ connection, lastDisconnect, qr }) {
     log('linked as', S.me.name)
     // resolve early if history already arrived or shortly after
     setTimeout(maybeReady, 12000)
+    // if the link raced a 515 restart, history may never arrive — at least
+    // pull groups so the chat list isn't empty, and emit what we have
+    setTimeout(() => {
+      if (!S.open || S.chats.size > 0) return
+      log('no history received — falling back to group fetch')
+      S.sock?.groupFetchAllParticipating?.()
+        .then((groups) => {
+          for (const g of Object.values(groups ?? {})) {
+            const m = upsertChat({ id: g.id, name: g.subject })
+            if (m) emit({ type: 'chat_update', chat: m })
+          }
+          log(`group fallback: ${S.chats.size} chats`)
+        })
+        .catch((e) => log('group fetch failed:', e?.message))
+    }, 15000)
   }
   if (connection === 'close') {
     S.open = false
@@ -417,8 +433,8 @@ function onHistory({ chats, contacts, messages, syncType, isLatest }) {
     const model = toModel(raw)
     if (model) { storeRaw(raw, model); n++ }
   }
-  if (syncType === 0 || isLatest) S.historyDone = true // FULL_BOOTSTRAP or latest chunk
-  log(`history sync: ${chats?.length ?? 0} chats, ${arr.length} messages (${n} stored)`)
+  if (isLatest || syncType === 0 || syncType === 7) S.historyDone = true // FULL_BOOTSTRAP / latest / NO_HISTORY
+  log(`history sync type=${syncType} latest=${!!isLatest}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
   maybeReady()
   if (S.historyDone) {
     emit({ type: 'history_done' })
@@ -657,6 +673,22 @@ const CMDS = {
     await ensureSocket()
     await Promise.race([waitReady(), sleep(30000)])
     return snapshot()
+  },
+
+  async logout() {
+    log('logout requested')
+    try { await S.sock?.logout() } catch (e) { log('logout call failed:', e?.message) }
+    // wipe regardless — the user asked to unpair this device
+    S.me = null
+    S.historyDone = false
+    S.chats.clear(); S.msgs.clear(); S.contacts.clear(); S.flags.starred.clear()
+    S.authState = null
+    try { S.sock?.end?.(undefined) } catch { /* already closed */ }
+    S.sock = null
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+    fs.mkdirSync(AUTH_DIR, { recursive: true })
+    setTimeout(ensureSocket, 400) // fresh socket → new QR
+    return { ok: true }
   },
 
   async loadOlder({ chatId, beforeTs, limit }) {

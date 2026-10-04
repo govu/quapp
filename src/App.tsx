@@ -3,12 +3,12 @@ import { AnimatePresence } from 'motion/react'
 import { DemoAdapter } from './bridge/demo'
 import { WsAdapter } from './bridge/ws'
 import type { ClientAdapter } from './bridge/types'
-import { boot, clearSelection, nextChat, setPalette, setPane, setSettingsOpen, useStore } from './store'
+import { boot, clearSelection, logout, nextChat, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
 import { Sidebar } from './ui/Sidebar'
 import { Conversation } from './ui/Conversation'
 import { Onboarding } from './ui/Onboarding'
 import { Palette } from './ui/Palette'
-import { Toasts } from './ui/common'
+import { Dialog, DialogButton, Toasts } from './ui/common'
 import { ContextMenuHost } from './ui/Menu'
 import { ForwardSheet } from './ui/Panes'
 
@@ -22,6 +22,20 @@ function makeAdapter(): ClientAdapter {
   // inside the packaged app the quappd daemon runs as a child process
   if (navigator.userAgent.includes('Electron')) return new WsAdapter('ws://127.0.0.1:8765')
   return new DemoAdapter()
+}
+
+function RelinkPrompt() {
+  const open = useStore((s) => s.relinkPrompt)
+  const account = useStore((s) => s.account)
+  return (
+    <Dialog open={open} onClose={() => setRelinkPrompt(false)} title="Link a different account?"
+      actions={<>
+        <DialogButton primary onClick={() => { setRelinkPrompt(false); logout() }}>Show QR</DialogButton>
+        <DialogButton onClick={() => setRelinkPrompt(false)}>Cancel</DialogButton>
+      </>}>
+      You'll be signed out of {account?.phone ?? 'this number'} and shown a QR code to link a different WhatsApp account.
+    </Dialog>
+  )
 }
 
 export default function App() {
@@ -105,6 +119,7 @@ export default function App() {
       <Palette />
       <Toasts />
       <ContextMenuHost />
+      <RelinkPrompt />
     </div>
   )
 }

@@ -287,6 +287,13 @@ export class DemoAdapter implements ClientAdapter {
     this.emit({ type: 'message_update', msg: nm })
   }
 
+  logout() {
+    // demo has nothing to unpair — simulate a relink so the flow doesn't stall
+    this.later(() => {
+      this.emit({ type: 'linked', account: { id: 'me', name: 'You', phone: '+34 600 00 00 00', avatarHue: 210, unreadTotal: 0 } })
+    }, 600)
+  }
+
   onEvent(cb: (e: ServerEvent) => void) {
     this.cbs.add(cb)
     return () => this.cbs.delete(cb)

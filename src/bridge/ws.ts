@@ -29,7 +29,10 @@ export class WsAdapter implements ClientAdapter {
     this.openP = new Promise((res, rej) => {
       const ws = new WebSocket(this.url)
       this.ws = ws
-      ws.onopen = () => res()
+      ws.onopen = () => {
+        this.push({ type: 'connection', state: 'open' }) // lets the store resync after a daemon restart
+        res()
+      }
       ws.onerror = (e) => rej(e)
       ws.onclose = () => {
         for (const p of this.pending.values()) p.rej(new Error('bridge disconnected'))
@@ -107,6 +110,7 @@ export class WsAdapter implements ClientAdapter {
   vote(chatId: Id, messageId: Id, optionIndexes: number[]) {
     void this.call('vote', { chatId, messageId, optionIndexes })
   }
+  logout() { void this.call('logout') }
   onEvent(cb: (e: ServerEvent) => void) {
     this.cbs.add(cb)
     return () => this.cbs.delete(cb)
