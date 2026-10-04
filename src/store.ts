@@ -48,6 +48,8 @@ interface State {
   chats: Map<Id, Chat>
   order: Id[]
   contacts: Map<Id, Contact>
+  /** rich contact profiles fetched on demand (info pane) */
+  profiles: Map<Id, import('./bridge/types').ProfileInfo>
   /** live history-sync counters while chunks stream in */
   syncing: { chats: number; contacts: number; messages: number; progress?: number } | null
   buckets: Map<Id, ChatBucket>
@@ -126,6 +128,7 @@ export const useStore = create<State>(() => ({
   chats: new Map(),
   order: [],
   contacts: new Map(),
+  profiles: new Map(),
   syncing: null,
   buckets: new Map(),
   typing: new Map(),
@@ -264,12 +267,16 @@ function flushEvents() {
   const buckets = new Map(s.buckets)
   const typing = new Map(s.typing)
   const online = new Map(s.online)
+  const contacts = new Map(s.contacts)
+  const profiles = new Map(s.profiles)
   const settings = s.settings
   const activeChat = s.activeChat
   let chatsTouched = false
   let bucketsTouched = false
   let typingTouched = false
   let onlineTouched = false
+  let contactsTouched = false
+  let profilesTouched = false
   let activeTouched: Id | null | undefined
 
   // lazily-cloned per-chat message maps — each chat's map clones at most once
@@ -421,6 +428,16 @@ function flushEvents() {
         }
         break
       }
+      case 'profile': {
+        const p = e.profile
+        profiles.set(p.jid, p)
+        profilesTouched = true
+        if (p.about) {
+          const c = contacts.get(p.jid)
+          if (c && c.about !== p.about) { contacts.set(p.jid, { ...c, about: p.about }); contactsTouched = true }
+        }
+        break
+      }
       case 'sync_progress': {
         patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
         break
@@ -441,6 +458,8 @@ function flushEvents() {
   if (bucketsTouched) next.buckets = buckets
   if (typingTouched) next.typing = typing
   if (onlineTouched) next.online = online
+  if (contactsTouched) next.contacts = contacts
+  if (profilesTouched) next.profiles = profiles
   if (activeTouched !== undefined) next.activeChat = activeTouched
   if (Object.keys(next).length) set(next)
 }
@@ -645,6 +664,19 @@ export function sendFile(chatId: Id, f: File, forceDoc = false) {
 export function setReplyTo(r: ReplyRef | null) { patch({ replyTo: r, editing: null }) }
 export function setEditing(m: Message | null) { patch({ editing: m, replyTo: null }) }
 export function setPane(p: Pane) { patch({ pane: p, searchHits: null }) }
+
+// profile fetches are deduped — the pane may mount several times in a row
+const profileAsked = new Set<Id>()
+export function requestProfile(jid: Id) {
+  const { adapter, profiles } = get()
+  if (!adapter?.profile || profileAsked.has(jid)) return
+  if (profiles.get(jid)?.about !== undefined) return // already have one
+  profileAsked.add(jid)
+  void adapter.profile(jid).then((p) => {
+    if (!p || 'error' in p) return
+    applyEvent({ type: 'profile', profile: p as import('./bridge/types').ProfileInfo })
+  }).catch(() => profileAsked.delete(jid))
+}
 export function setQuery(q: string) { patch({ query: q }) }
 export function setFilter(f: Filter) { patch({ filter: f, showArchived: false }) }
 export function setShowArchived(v: boolean) { patch({ showArchived: v }) }

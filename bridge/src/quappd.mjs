@@ -854,6 +854,9 @@ function onConn({ connection, lastDisconnect, qr }) {
     log('linked as', S.me.name)
     // resolve early if history already arrived or shortly after
     setTimeout(maybeReady, 12000)
+    // reconnects never get a history push — without this the "history is
+    // settled" flag stays false and live-media warmup never runs
+    setTimeout(() => { if (S.open && !S.historySeen) S.historyDone = true }, 20000)
     // if the link raced a 515 restart, history may never arrive — at least
     // pull groups so the chat list isn't empty, and emit what we have
     setTimeout(() => {
@@ -888,18 +891,26 @@ function onConn({ connection, lastDisconnect, qr }) {
           })
           .catch((e) => log('group fetch failed:', e?.message))
       }
-      // discovery: probe contacts AND known-but-empty chats for on-demand
+      // discovery: probe contacts, empty chats AND stale chats for on-demand
       // history (ZapFast: a chat that synced with a name and no messages gets
-      // asked as soon as it loads or opens — we ask in bulk once)
+      // asked as soon as it loads or opens — we ask in bulk once). Stale
+      // covers the real gap: messages lost to a dead session never get
+      // requeued, so the newest tail the phone has must be pulled per chat
       setTimeout(() => {
         if (!S.open) return
         const known = new Set(S.chats.keys())
+        const staleBefore = Date.now() - 6 * 3600 * 1000
         const emptyChats = [...known].filter((j) => !msgsOf(j).size && (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')))
+        const staleChats = [...known].filter((j) => {
+          if (!msgsOf(j).size) return false // empty chats handled above
+          return lastMsgTs(j) < staleBefore // newest stored msg is old → tail gap
+        })
         const candidates = [
           ...emptyChats,
+          ...staleChats,
           ...[...S.contacts.keys()].filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j)),
-        ].slice(0, 150)
-        log(`contact discovery: ${candidates.length} candidates (${emptyChats.length} empty chats)`)
+        ].slice(0, 200)
+        log(`contact discovery: ${candidates.length} candidates (${emptyChats.length} empty, ${staleChats.length} stale)`)
         if (!candidates.length) return
         let i = 0
         const tick = () => {
@@ -1065,6 +1076,7 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
   emit({ type: 'history_done' })
   kickMetaQueue()
   void prefetchMedia()
+  warmAvatars()
 }
 
 // background media warmup — the phone's CDN links are freshest right after
@@ -1366,17 +1378,15 @@ function queueAvatar(jid) {
   if (S.avatarQueued.has(jid)) return
   S.avatarQueued.add(jid)
   metaQueue.push(async () => {
-    try {
-      // warm the /a/ proxy cache — do NOT expose the raw CDN url
-      // (it expires); the proxy resolves a fresh one per request
-      const url = await S.sock.profilePictureUrl(jid, 'preview')
-      if (url) {
-        const r = await fetch(url)
-        if (r.ok) avatarCache.set(jid, { buf: Buffer.from(await r.arrayBuffer()), mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() })
-      }
-    } catch { /* no picture */ }
+    await avatarFetch(jid, false).catch(() => {})
   })
   kickMetaQueue()
+}
+// warm the newest chats' photos — the sidebar paints instantly and the CDN
+// links are freshest right after connect/history
+function warmAvatars() {
+  const chats = [...S.chats.values()].sort((a, b) => b.lastActivity - a.lastActivity).slice(0, 40)
+  for (const c of chats) if (c.kind === 'dm' || c.kind === 'group') queueAvatar(c.id)
 }
 const metaRetry = new Map() // jid -> attempts (ZapFast-style backoff)
 function queueGroupMeta(jid, attempt = 0) {
@@ -1723,8 +1733,11 @@ const CMDS = {
       saveFlags()
       emit({ type: 'chat_update', chat })
     }
-    // ZapFast: a chat that opened with no local messages asks the phone
+    // ZapFast: a chat that opened with no local messages asks the phone — and
+    // a chat whose newest message is older than a couple hours gets its tail
+    // refreshed too, closing gaps left by dropped deliveries
     if (!msgsOf(jid).size) void requestHistory(jid, 80, true)
+    else if (Date.now() - (lastMsgTs(jid) || 0) > 2 * 3600 * 1000) void requestHistory(jid, 25, true)
   },
 
   async markUnread({ chatId, value }) {
@@ -1790,6 +1803,37 @@ const CMDS = {
 
   async blocklist() {
     try { return { jids: await S.sock.fetchBlocklist() } } catch { return { jids: [] } }
+  },
+
+  // rich contact profile for the info pane — about, business info, hi-res pic.
+  // Also persists `about` onto the contact so the next boot shows it instantly.
+  async profile({ jid }) {
+    const j = canonicalJid(norm(jid))
+    if (!j || !S.sock || !S.open) return { error: 'offline' }
+    const [statusR, bizR] = await Promise.allSettled([
+      S.sock.fetchStatus(j),
+      S.sock.getBusinessProfile ? S.sock.getBusinessProfile(j) : Promise.resolve(null),
+    ])
+    const stList = statusR.status === 'fulfilled' ? statusR.value : null
+    const st = Array.isArray(stList) ? stList.find((x) => norm(x.id) === j || x.id?.includes(j.split('@')[0])) ?? stList[0] : stList
+    const about = st?.status?.status ?? (typeof st?.status === 'string' ? st.status : null)
+    const bizRaw = bizR.status === 'fulfilled' ? bizR.value : null
+    const biz = bizRaw?.wid || bizRaw?.description || bizRaw?.category ? {
+      description: bizRaw.description ?? '',
+      website: bizRaw.website ?? [],
+      email: bizRaw.email ?? null,
+      category: bizRaw.category ?? null,
+      address: bizRaw.address ?? null,
+    } : null
+    if (about) {
+      upsertContact({ id: j })
+      const c = S.contacts.get(j)
+      if (c) { c.about = about; markDirty() }
+    }
+    void avatarFetch(j, true).catch(() => {}) // warm the hi-res while the pane is open
+    const payload = { jid: j, about, since: st?.status?.setAt ?? null, biz }
+    emit({ type: 'profile', profile: payload })
+    return payload
   },
 
   async leaveGroup({ chatId }) {
@@ -1942,34 +1986,97 @@ function mediaMime(chatId, messageId) {
   return c.mimetype ?? 'application/octet-stream'
 }
 
+// ---------- avatar pipeline ----------
+// Three tiers, disk-backed so a daemon restart doesn't re-hammer WhatsApp's
+// profile-pic endpoint (it rate-limits hard — that was the blank-avatar bug):
+//   mem (hot) → disk (AVATAR_DIR, 24h) → profilePictureUrl → CDN fetch
+// Misses are negative-cached 6h so privacy-blocked jids don't get pounded.
+const AVATAR_DIR = path.join(DATA, 'avatars')
+const AVATAR_INDEX = path.join(AVATAR_DIR, 'index.json')
+fs.mkdirSync(AVATAR_DIR, { recursive: true })
 const avatarCache = new Map() // jid -> {buf, mime, at}
+const avatarIdx = new Map() // jid -> {f, mime, hi, at}
+const avatarMiss = new Map() // jid -> ts (negative cache, session-only)
+const avatarInflight = new Map() // jid|big -> Promise<entry|null>
+let avatarIdxDirty = false
+try {
+  const raw = JSON.parse(fs.readFileSync(AVATAR_INDEX, 'utf8'))
+  for (const [j, e] of Object.entries(raw)) if (e?.f && fs.existsSync(path.join(AVATAR_DIR, e.f))) avatarIdx.set(j, e)
+} catch { /* first boot or wiped dir */ }
+const avatarIdxSave = () => {
+  if (!avatarIdxDirty) return
+  avatarIdxDirty = false
+  try {
+    const tmp = AVATAR_INDEX + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(avatarIdx)))
+    fs.renameSync(tmp, AVATAR_INDEX)
+  } catch { /* best effort */ }
+}
+setInterval(avatarIdxSave, 15000).unref()
+const avatarFile = (jid) => crypto.createHash('sha1').update(jid).digest('hex').slice(0, 20)
+const AV_MISS_TTL = 6 * 3600 * 1000
+const AV_DISK_TTL = 24 * 3600 * 1000
+
+function avatarFromDisk(entry) {
+  try {
+    const buf = fs.readFileSync(path.join(AVATAR_DIR, entry.f))
+    avatarCache.set(entry._jid, { buf, mime: entry.mime, at: entry.at })
+    return { buf, mime: entry.mime, at: entry.at }
+  } catch { avatarIdx.delete(entry._jid); avatarIdxDirty = true; return null }
+}
+
+async function avatarFetch(jid, big) {
+  const key = jid + (big ? '|big' : '')
+  let p = avatarInflight.get(key)
+  if (p) return p
+  p = (async () => {
+    const mem = avatarCache.get(jid)
+    if (mem && (!big || avatarIdx.get(jid)?.hi) && Date.now() - mem.at < 300_000) return mem
+    const disk = avatarIdx.get(jid)
+    if (disk && Date.now() - disk.at < AV_DISK_TTL && (!big || disk.hi)) {
+      const hit = avatarFromDisk({ ...disk, _jid: jid })
+      if (hit) return hit
+    }
+    // negative cache: no-picture jids only get re-asked every 6h
+    if ((avatarMiss.get(jid) ?? 0) > Date.now() - AV_MISS_TTL) {
+      return disk ? avatarFromDisk({ ...disk, _jid: jid }) : null
+    }
+    try {
+      const url = await S.sock?.profilePictureUrl(jid, big ? 'image' : 'preview')
+      if (!url) throw new Error('no picture')
+      const r = await fetch(url)
+      if (!r.ok) throw new Error('cdn ' + r.status)
+      const buf = Buffer.from(await r.arrayBuffer())
+      const entry = { buf, mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() }
+      avatarCache.set(jid, entry)
+      // a hi-res fetch upgrades the stored copy; a preview fetch only fills a void
+      const prev = avatarIdx.get(jid)
+      if (big || !prev?.hi) {
+        const f = avatarFile(jid)
+        try { fs.writeFileSync(path.join(AVATAR_DIR, f), buf) } catch { /* disk full? */ }
+        avatarIdx.set(jid, { f, mime: entry.mime, hi: big || !!prev?.hi, at: entry.at })
+        avatarIdxDirty = true
+      }
+      avatarMiss.delete(jid)
+      return entry
+    } catch {
+      avatarMiss.set(jid, Date.now())
+      return disk ? avatarFromDisk({ ...disk, _jid: jid }) : null // stale beats nothing
+    } finally { avatarInflight.delete(key) }
+  })()
+  avatarInflight.set(key, p)
+  return p
+}
+
 const mediaServer = http.createServer(async (req, res) => {
   if (!DEV && /[?&]token=([^&]+)/.exec(req.url ?? '')?.[1] !== TOKEN) { res.writeHead(403).end(); return }
   const av = /^\/a\/([^/?]+)/.exec(req.url ?? '')
   if (av) {
     const jid = decodeURIComponent(av[1])
-    try {
-      const hit = avatarCache.get(jid)
-      if (hit && Date.now() - hit.at < 300_000) {
-        res.writeHead(200, { 'content-type': hit.mime, 'cache-control': 'private, max-age=300' })
-        res.end(hit.buf)
-        return
-      }
-      const url = await S.sock?.profilePictureUrl(jid, 'image')
-      if (!url) throw new Error('none')
-      const r = await fetch(url)
-      if (!r.ok) throw new Error('fetch ' + r.status)
-      const buf = Buffer.from(await r.arrayBuffer())
-      avatarCache.set(jid, { buf, mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() })
-      res.writeHead(200, { 'content-type': avatarCache.get(jid).mime, 'cache-control': 'private, max-age=300' })
-      res.end(buf)
-    } catch {
-      if (avatarCache.has(jid)) { // stale beats nothing
-        const hit = avatarCache.get(jid)
-        res.writeHead(200, { 'content-type': hit.mime }); res.end(hit.buf); return
-      }
-      res.writeHead(404).end()
-    }
+    const hit = await avatarFetch(jid, /[?&]big=1/.test(req.url ?? ''))
+    if (!hit) { res.writeHead(404).end(); return }
+    res.writeHead(200, { 'content-type': hit.mime, 'cache-control': 'private, max-age=300' })
+    res.end(hit.buf)
     return
   }
   const m = /^\/m\/([^/]+)\/([^/?]+)/.exec(req.url ?? '')
@@ -1978,7 +2085,27 @@ const mediaServer = http.createServer(async (req, res) => {
   const buf = await mediaBuffer(chatId, msgId)
   if (buf === 'gone') { res.writeHead(410).end(); return }
   if (!buf) { res.writeHead(404).end(); return }
-  res.writeHead(200, { 'content-type': mediaMime(chatId, msgId), 'cache-control': 'private, max-age=86400' })
+  const mime = mediaMime(chatId, msgId)
+  // Range support: <audio>/<video> need it for duration probing + seeking;
+  // without it Chrome may refuse ogg/opus playback entirely
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '')
+  if (range && (range[1] || range[2])) {
+    const start = range[1] ? parseInt(range[1]) : Math.max(0, buf.length - parseInt(range[2]))
+    const end = range[2] ? Math.min(buf.length - 1, parseInt(range[2])) : buf.length - 1
+    if (start >= buf.length || end < start) {
+      res.writeHead(416, { 'content-range': `bytes */${buf.length}` }).end()
+      return
+    }
+    res.writeHead(206, {
+      'content-type': mime, 'accept-ranges': 'bytes',
+      'content-range': `bytes ${start}-${end}/${buf.length}`,
+      'content-length': end - start + 1,
+      'cache-control': 'private, max-age=86400',
+    })
+    res.end(buf.subarray(start, end + 1))
+    return
+  }
+  res.writeHead(200, { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': buf.length, 'cache-control': 'private, max-age=86400' })
   res.end(buf)
 })
 

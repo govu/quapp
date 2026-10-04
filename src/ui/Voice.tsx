@@ -12,17 +12,25 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
   const [pos, setPos] = useState(0)
   const [dur, setDur] = useState(c.duration || 0)
   const [playing, setPlaying] = useState(false)
+  const [fail, setFail] = useState(0) // 0 ok · 1 retrying · 2 dead
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const barsRef = useRef<HTMLDivElement>(null)
 
-  const audio = () => {
+  const audio = (fresh = false) => {
+    if (fresh && audioRef.current) { audioRef.current.src = ''; audioRef.current = null }
     if (!audioRef.current) {
       const a = new Audio(c.url ?? c.file)
       a.preload = 'metadata'
-      a.addEventListener('loadedmetadata', () => setDur(a.duration && isFinite(a.duration) ? a.duration : c.duration))
+      a.addEventListener('loadedmetadata', () => { setFail(0); setDur(a.duration && isFinite(a.duration) ? a.duration : c.duration) })
       a.addEventListener('timeupdate', () => setPos(a.currentTime))
       a.addEventListener('ended', () => { setPlaying(false); setPos(0) })
-      a.addEventListener('error', () => { setPlaying(false) })
+      a.addEventListener('error', () => {
+        setPlaying(false)
+        if (fail === 0) {
+          setFail(1)
+          setTimeout(() => { const a2 = audio(true); void a2.play().then(() => setPlaying(true)).catch(() => setFail(2)) }, 2500)
+        } else setFail(2)
+      })
       audioRef.current = a
     }
     return audioRef.current
@@ -30,13 +38,14 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
 
   useEffect(() => () => {
     if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ''; audioRef.current = null }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const toggle = () => {
+    if (fail === 2) return
     const a = audio()
-    if (playing) a.pause()
-    else void a.play()
-    setPlaying(!playing)
+    if (playing) { a.pause(); setPlaying(false) }
+    else { void a.play().then(() => setPlaying(true)).catch(() => setFail(2)) }
   }
 
   const seek = (e: React.MouseEvent) => {
@@ -68,13 +77,15 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
     <div className="flex w-[230px] items-center gap-2.5 py-0.5">
       <button
         onClick={toggle}
+        disabled={fail === 2}
         className={cx(
           'press grid size-[38px] shrink-0 place-items-center rounded-full',
           out ? 'bg-white/25 text-white' : 'bg-[var(--blue)] text-white',
+          (fail === 2 || fail === 1) && 'opacity-40'
         )}
         aria-label={playing ? 'Pause' : 'Play'}
       >
-        {playing ? <Pause size={17} weight="fill" /> : <Play size={17} weight="fill" className="translate-x-[1px]" />}
+        {fail === 2 ? <Play size={17} weight="fill" className="translate-x-[1px]" /> : playing ? <Pause size={17} weight="fill" /> : <Play size={17} weight="fill" className="translate-x-[1px]" />}
       </button>
       <div
         ref={barsRef}
@@ -98,7 +109,7 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
         })}
       </div>
       <span className={cx('shrink-0 text-[11.5px] tabular-nums', out ? 'text-white/75' : 'text-[var(--label-2)]')}>
-        {durationLabel(pos > 0 && playing ? pos : dur)}
+        {fail === 2 ? 'n/a' : fail === 1 ? '…' : durationLabel(pos > 0 && playing ? pos : dur)}
       </span>
     </div>
   )

@@ -129,6 +129,7 @@ export class WsAdapter implements ClientAdapter {
   leaveGroup(chatId: Id) { return this.call<void>('leaveGroup', { chatId }) }
   setPrivacy(setting: string, value: string) { void this.call('setPrivacy', { setting, value }) }
   blocklist() { return this.call<{ jids: string[] }>('blocklist').then((r) => r.jids) }
+  profile(jid: Id) { return this.call<import('./types').ProfileInfo>('profile', { jid }) }
   storageStats() { return this.call<{ bytes: number; files: number }>('storageStats') }
   clearCache() { return this.call<{ freed: number }>('clearCache').then((r) => r.freed) }
   download(chatId: Id, messageId: Id) {

@@ -6,7 +6,7 @@ import {
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doFlag, doForward, doLeaveGroup, jumpTo, searchInChat, setPane, toast, useStore,
+  doFlag, doForward, doLeaveGroup, jumpTo, requestProfile, searchInChat, setPane, toast, useStore,
 } from '../store'
 import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
@@ -178,17 +178,43 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
   }, [bucket])
 
   const contact = chat.contactId ? contacts.get(chat.contactId) : undefined
+  const profile = useStore((s) => s.profiles.get(chat.id))
+  const [bigPhoto, setBigPhoto] = useState(false)
+  // pull the live profile (about/business) + warm the hi-res pic — dm/saved only
+  const isDm = chat.kind === 'dm' || chat.kind === 'saved'
+  useEffect(() => {
+    if (isDm && chat.id.includes('@')) requestProfile(chat.id)
+  }, [chat.id, isDm])
+  const phone = contact?.phone ?? (isDm && chat.id.endsWith('@s.whatsapp.net') ? '+' + chat.id.split('@')[0] : undefined)
+  const about = profile?.about ?? contact?.about
+  const bigUrl = chat.avatarUrl ? chat.avatarUrl + '&big=1' : undefined
 
   return (
     <PaneShell title={chat.kind === 'group' ? 'Group info' : chat.kind === 'channel' ? 'Channel info' : 'Contact info'} onClose={() => setPane(null)}>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex flex-col items-center px-4 pb-5 pt-6 text-center">
-          <Avatar name={chat.title} hue={chat.avatarHue} url={chat.avatarUrl} size={96} />
+          <button
+            className="press rounded-full"
+            onClick={() => bigUrl && setBigPhoto(true)}
+            title={bigUrl ? 'View photo' : undefined}
+          >
+            <Avatar name={chat.title} hue={chat.avatarHue} url={bigUrl} size={96} />
+          </button>
+          {bigPhoto && bigUrl && (
+            <div
+              className="fixed inset-0 z-50 grid place-items-center bg-black/70 backdrop-blur-sm"
+              onClick={() => setBigPhoto(false)}
+            >
+              <img src={bigUrl} alt="" className="max-h-[80vh] max-w-[80vw] rounded-2xl shadow-2xl" />
+            </div>
+          )}
           <div className="mt-3 text-[19px] font-semibold">{chat.kind === 'saved' ? 'You' : chat.title}</div>
           <div className="mt-0.5 text-[13.5px] text-[var(--label-2)]">
-            {contact?.phone ?? (chat.kind === 'group' ? `Group · ${chat.participants.length} members` : chat.kind === 'channel' ? 'Channel' : '')}
+            {phone ?? (chat.kind === 'group' ? `Group · ${chat.participants.length} members` : chat.kind === 'channel' ? 'Channel' : '')}
           </div>
-          {contact?.about && <div className="mt-2 max-w-[260px] text-[13.5px] leading-relaxed text-[var(--label-2)]">{contact.about}</div>}
+          {about
+            ? <div className="mt-2 max-w-[260px] text-[13.5px] leading-relaxed text-[var(--label-2)]">{about}</div>
+            : isDm && profile === undefined && <div className="mt-2 h-4 w-32 animate-pulse rounded bg-[var(--fill-3)]" />}
           {chat.kind !== 'saved' && chat.kind !== 'channel' && (
             <div className="mt-4 flex gap-6">
               <RoundAction icon={<Phone size={19} />} label="Call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')} />
@@ -197,6 +223,20 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
             </div>
           )}
         </div>
+
+        {profile?.biz && (
+          <Section title={profile.biz.category ?? 'Business'}>
+            <div className="px-4 pb-2">
+              {profile.biz.description && <div className="text-[13.5px] leading-relaxed">{profile.biz.description}</div>}
+              {profile.biz.website?.filter(Boolean).map((w) => (
+                <a key={w} href={w.startsWith('http') ? w : `https://${w}`} target="_blank" rel="noreferrer"
+                  className="mt-1 block truncate text-[13px] text-[var(--blue)] no-underline">{w}</a>
+              ))}
+              {profile.biz.email && <div className="mt-1 text-[13px] text-[var(--label-2)]">{profile.biz.email}</div>}
+              {profile.biz.address && <div className="mt-1 text-[13px] text-[var(--label-3)]">{profile.biz.address}</div>}
+            </div>
+          </Section>
+        )}
 
         {media.length > 0 && (
           <Section title={`Media · ${media.length}`}>

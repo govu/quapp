@@ -112,6 +112,20 @@ export interface SearchHit {
   chatId: Id
 }
 
+/** rich contact profile fetched on demand (info pane) */
+export interface ProfileInfo {
+  jid: Id
+  about?: string | null
+  since?: number | null
+  biz?: {
+    description: string
+    website: string[]
+    email: string | null
+    category: string | null
+    address: string | null
+  } | null
+}
+
 export type OutContent =
   | { kind: 'text'; text: string }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: true; url?: string; dataUrl?: string }
@@ -138,6 +152,7 @@ export type ServerEvent =
   | { type: 'history_done' }
   | { type: 'older_result'; chatId: Id; count: number; hasMore: boolean }
   | { type: 'sync_progress'; chats: number; contacts: number; messages: number; progress?: number | null; done?: boolean }
+  | { type: 'profile'; profile: ProfileInfo }
   /** a command failed at the bridge — the UI surfaces it as a toast */
   | { type: 'bridge_error'; message: string }
 
@@ -182,6 +197,8 @@ export interface ClientAdapter {
   leaveGroup?(chatId: Id): Promise<void>
   setPrivacy?(setting: 'lastSeen' | 'profilePhoto' | 'groupsAdd' | 'readReceipts' | 'status', value: string): void
   blocklist?(): Promise<string[]>
+  /** fetch a contact's rich profile (about/business/hi-res pic warm) */
+  profile?(jid: Id): Promise<ProfileInfo | { error?: string }>
   storageStats?(): Promise<{ bytes: number; files: number }>
   clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void
