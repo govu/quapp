@@ -7,7 +7,7 @@ import {
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, toast, useStore,
+  doCallHandoff, doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doRejectCall, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, useStore,
 } from '../store'
 import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
@@ -234,8 +234,8 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
             : isDm && profile === undefined && <div className="mt-2 h-4 w-32 animate-pulse rounded bg-[var(--fill-3)]" />}
           {chat.kind !== 'saved' && chat.kind !== 'channel' && (
             <div className="mt-4 flex gap-6">
-              <RoundAction icon={<Phone size={19} />} label="Call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')} />
-              <RoundAction icon={<VideoCamera size={20} />} label="Video" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')} />
+              <RoundAction icon={<Phone size={19} />} label="Call" onClick={() => doCallHandoff(chat.id, false)} />
+              <RoundAction icon={<VideoCamera size={20} />} label="Video" onClick={() => doCallHandoff(chat.id, true)} />
               <RoundAction icon={<MagnifyingGlass size={19} />} label="Search" onClick={() => setPane('search')} />
             </div>
           )}
@@ -557,6 +557,41 @@ export function ForwardSheet() {
           Forward{picked.size > 1 ? ` to ${picked.size} chats` : ''}
         </button>
       </motion.div>
+    </motion.div>
+  )
+}
+
+// ---------- incoming call ----------
+export function CallOverlay() {
+  const call = useStore((s) => s.incomingCall)
+  const chat = useStore((s) => (s.incomingCall ? s.chats.get(s.incomingCall.chatId) : undefined))
+  if (!call) return null
+  const title = chat?.title ?? call.from.split('@')[0]
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -18, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: -14, scale: 0.97 }}
+      transition={spring.pop}
+      role="alert"
+      aria-live="assertive"
+      className="menu-material fixed left-1/2 top-[52px] z-[90] flex w-[320px] -translate-x-1/2 items-center gap-3 rounded-2xl p-3.5 shadow-2xl"
+    >
+      <Avatar name={title} hue={chat?.avatarHue ?? 0} url={chat?.avatarUrl} size={44} />
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-[15px] font-semibold">{title}</div>
+        <div className="flex items-center gap-1.5 text-[12.5px] text-[var(--label-3)]">
+          {call.video ? <VideoCamera size={13} /> : <Phone size={13} />}
+          Incoming {call.video ? 'video' : 'voice'} call — answer on your phone
+        </div>
+      </div>
+      <button
+        onClick={doRejectCall}
+        aria-label="Decline call"
+        className="press grid size-[38px] shrink-0 place-items-center rounded-full bg-[var(--red)] text-white"
+      >
+        <Phone size={18} style={{ transform: 'rotate(135deg)' }} />
+      </button>
     </motion.div>
   )
 }

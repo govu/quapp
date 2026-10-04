@@ -292,7 +292,9 @@ body.mica .vibrancy {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
-body.mica .chrome { background: transparent; }
+/* headers/composer stay opaque over the material — Mica showing behind text
+   reads as a rendering glitch; only the sidebar body exposes it */
+body.mica .chrome { background: var(--chrome); }
 /* reserve room for the overlay caption buttons — they sit top-right over the
    conversation header whenever the native titlebar is hidden */
 .caption-inset { padding-right: 138px; }
@@ -352,14 +354,14 @@ body.mica .chrome { background: transparent; }
 }
 .wall-dusk {
   background:
-    radial-gradient(120% 90% at 15% 0%, rgba(0, 122, 255, 0.10) 0%, transparent 55%),
-    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.10) 0%, transparent 55%),
+    radial-gradient(120% 90% at 15% 0%, rgba(0, 122, 255, 0.045) 0%, transparent 55%),
+    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.04) 0%, transparent 55%),
     var(--wall);
 }
 .dark .wall-dusk {
   background:
-    radial-gradient(120% 90% at 15% 0%, rgba(10, 132, 255, 0.12) 0%, transparent 55%),
-    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.12) 0%, transparent 55%),
+    radial-gradient(120% 90% at 15% 0%, rgba(10, 132, 255, 0.05) 0%, transparent 55%),
+    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.045) 0%, transparent 55%),
     var(--wall);
 }
 .wall-none { background: var(--bg-grouped); }

@@ -848,6 +848,45 @@ async function ensureSocket() {
     sock.ev.on('lid-mapping.update', safe((m) => {
       if (m?.lid && m?.pn) learnLid(m.lid, m.pn)
     }))
+    // calls: linked devices can't carry voice/video (the call stack is a
+    // separate E2E VoIP path WhatsApp never exposes to companions) — what we
+    // CAN do: show incoming calls live, decline them (rejectCall is real),
+    // and file the outcome in the transcript like WhatsApp does
+    sock.ev.on('call', safe((calls) => {
+      for (const c of calls ?? []) {
+        const chatJid = canonicalJid(norm(c.isGroup ? (c.groupJid ?? c.chatId) : c.chatId))
+        emit({
+          type: 'call',
+          call: {
+            id: c.id, chatId: chatJid, from: canonicalJid(norm(c.from ?? '')),
+            video: !!c.isVideo, group: !!c.isGroup, status: c.status,
+            date: c.date ? +c.date : Date.now(), offline: !!c.offline,
+          },
+        })
+        if (!['terminate', 'timeout', 'reject'].includes(c.status)) continue
+        const prior = callState.get(c.id) ?? {}
+        callState.set(c.id, { ...prior, status: c.status })
+        if (prior.logged) continue
+        const missed = c.status === 'timeout' || (c.status === 'terminate' && !prior.answered && !prior.mine)
+        const text = (prior.mine ? 'Outgoing' : missed ? 'Missed' : c.status === 'reject' ? 'Declined' : 'Incoming')
+          + (c.isVideo ? ' video call' : ' voice call')
+        callState.set(c.id, { ...prior, status: c.status, logged: true })
+        const chat = chatOf(chatJid); if (!chat) continue
+        const id = 'call-' + c.id
+        if (msgsOf(chatJid).has(id)) continue
+        storeRaw(
+          { key: { id, remoteJid: chatJid, fromMe: !!prior.mine }, messageTimestamp: Math.floor((c.date ? +c.date : Date.now()) / 1000) },
+          { id, chatId: chatJid, ts: c.date ? +c.date : Date.now(), fromMe: !!prior.mine, senderName: '', content: { kind: 'system', text }, status: 'sent', v: 1 },
+        )
+        chat.lastActivity = Math.max(chat.lastActivity, c.date ? +c.date : Date.now())
+        emit({ type: 'chat_update', chat })
+        emit({ type: 'message', msg: msgsOf(chatJid).get(id).model })
+      }
+      for (const c of calls ?? []) {
+        if (c.status === 'offer') callState.set(c.id, { from: c.from, answered: false })
+        else if (c.status === 'accept' || c.status === 'preaccept') callState.set(c.id, { ...(callState.get(c.id) ?? {}), answered: true })
+      }
+    }))
     log('socket started, protocol', version.join('.'))
   } catch (e) {
     S.sock = null
@@ -1581,6 +1620,7 @@ async function requestHistory(chatId, count = 80, explicit = false, tail = false
 // consecutive unanswered PDO requests = the phone is rate-limiting → pause the
 // discovery sweep (a dead sweep burns the whole budget). Any response resets.
 let discoveryPauseUntil = 0
+const callState = new Map() // call-id -> {from, answered, mine, logged, status}
 let unansweredStreak = 0
 let discoveryRan = false // the sweep runs once per session — never re-bursts
 // tail-refresh cooldown per chat — a permanently-stale chat (phone answers
@@ -1677,6 +1717,7 @@ const CMDS = {
     avatarCache.clear(); avatarIdx.clear(); avatarMiss.clear(); avatarInflight.clear()
     mediaDead.clear()
     lastTailAsk.clear()
+    callState.clear()
     discoveryRan = false
     discoveryPauseUntil = 0; unansweredStreak = 0
     S.subscribedPresence.clear()
@@ -2070,6 +2111,13 @@ const CMDS = {
     if (!subject?.trim() || !jids.length) return { error: 'need a subject and members' }
     const res = await S.sock.groupCreate(subject.trim().slice(0, 100), jids)
     return { chatId: res?.gid ?? null }
+  },
+
+  async rejectCall({ callId, callFrom }) {
+    await S.sock.rejectCall(callId, callFrom)
+    const st = callState.get(callId) ?? {}
+    callState.set(callId, { ...st, mine: true })
+    return { ok: true }
   },
 
   async leaveGroup({ chatId }) {

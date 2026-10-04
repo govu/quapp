@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type {
-  Account, Chat, ClientAdapter, Contact, Id, Message, MsgContent, OutContent, ReplyRef, ServerEvent,
+  Account, CallInfo, Chat, ClientAdapter, Contact, Id, Message, MsgContent, OutContent, ReplyRef, ServerEvent,
 } from './bridge/types'
 
 export type Filter = 'all' | 'unread' | 'favorites' | 'groups'
@@ -86,6 +86,8 @@ interface State {
   starredList: Message[] | 'loading' | null
   /** new-group picker sheet */
   groupSheet: boolean
+  /** a live incoming call — set on 'offer', cleared on terminate/timeout */
+  incomingCall: CallInfo | null
 }
 
 let toastId = 0
@@ -171,6 +173,7 @@ export const useStore = create<State>(() => ({
   confirm: null,
   starredList: null,
   groupSheet: false,
+  incomingCall: null,
   settings: loadSettings(),
 }))
 
@@ -486,6 +489,21 @@ function flushEvents() {
         patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
         break
       }
+      case 'call': {
+        const c = e.call
+        if (c.status === 'offer' && !c.offline) {
+          patch({ incomingCall: c })
+          const chat = chats.get(c.chatId)
+          if (get().settings.notifications && notifAllowed === 'granted' && !document.hasFocus()) {
+            const n = new Notification(chat?.title ?? 'Quapp', { body: c.video ? 'Incoming video call' : 'Incoming voice call', tag: `quapp-call-${c.id}`, icon: chat?.avatarUrl })
+            n.onclick = () => { window.focus(); openChat(c.chatId) }
+          } else if (get().settings.notifSound) notifBlip()
+        } else if (['timeout', 'terminate', 'reject', 'accept'].includes(c.status)) {
+          const cur = get().incomingCall
+          if (cur?.id === c.id) patch({ incomingCall: null })
+        }
+        break
+      }
       case 'bridge_error': {
         toast(e.message, 'error')
         break
@@ -666,9 +684,14 @@ export function nextChat(dir: 1 | -1) {
   if (next) openChat(next)
 }
 
+// after an empty page the phone is almost certainly rate-limiting — quiet the
+// scroll trigger instead of burning another PDO round-trip every swipe
+const olderQuiet = new Map<Id, number>()
+
 export async function loadOlder(chatId: Id) {
   const { adapter } = get()
   if (!adapter) return
+  if (Date.now() < (olderQuiet.get(chatId) ?? 0)) return 0
   const b = get().buckets.get(chatId)
   if (b && !b.hasMore) return
   const first = b?.ids.length ? b.map.get(b.ids[0]) : undefined
@@ -695,6 +718,7 @@ export async function loadOlder(chatId: Id) {
   }
   nb.set(chatId, { ids: merged, map, hasMore: page.hasMore, loaded: true })
   set({ buckets: nb })
+  if (!page.messages.length && page.hasMore) olderQuiet.set(chatId, Date.now() + 90_000)
   return page.messages.length
 }
 
@@ -986,6 +1010,25 @@ export function setDraft(chatId: Id, text: string) {
 }
 export function setPalette(v: boolean) { patch({ paletteOpen: v }) }
 export function setGroupSheet(v: boolean) { patch({ groupSheet: v }) }
+
+/** decline a ringing call — real protocol reject */
+export function doRejectCall() {
+  const c = get().incomingCall
+  if (!c) return
+  patch({ incomingCall: null })
+  void get().adapter?.rejectCall?.(c.id, c.from).catch(() => toast("Couldn't decline the call", 'error'))
+}
+
+/** outgoing calls can't be carried by a linked device — hand off to the
+ *  official WhatsApp app (installed = the call actually dials) */
+export function doCallHandoff(chatId: Id, video: boolean) {
+  const chat = get().chats.get(chatId)
+  if (!chat) return
+  const phone = chatId.split('@')[0]?.replace(/\D/g, '')
+  if (!phone) { toast('Calls only work for individual contacts', 'error'); return }
+  window.open(`whatsapp://${video ? 'video' : 'call'}?phone=${phone}`, '_self')
+  toast('Opening WhatsApp to place the call…', 'info')
+}
 
 export async function doCreateGroup(subject: string, jids: Id[]) {
   const r = await get().adapter?.createGroup?.(subject, jids).catch(() => undefined)

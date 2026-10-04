@@ -9,7 +9,7 @@ import { Onboarding } from './ui/Onboarding'
 import { Palette } from './ui/Palette'
 import { Dialog, DialogButton, Toasts } from './ui/common'
 import { ContextMenuHost } from './ui/Menu'
-import { ForwardSheet, GroupSheet } from './ui/Panes'
+import { CallOverlay, ForwardSheet, GroupSheet } from './ui/Panes'
 
 const SettingsSheet = lazy(() => import('./ui/Settings').then((m) => ({ default: m.SettingsSheet })))
 
@@ -163,6 +163,7 @@ export default function App() {
         </Suspense>
         <AnimatePresence>{forwarding && <ForwardSheet />}</AnimatePresence>
         <AnimatePresence>{groupSheet && <GroupSheet />}</AnimatePresence>
+        <AnimatePresence><CallOverlay /></AnimatePresence>
         <Palette />
         <Toasts />
         <ContextMenuHost />

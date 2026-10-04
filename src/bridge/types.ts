@@ -73,6 +73,21 @@ export type MsgContent =
   | { kind: 'system'; text: string }
   | { kind: 'deleted' }
 
+/** a WhatsApp call lifecycle event — linked devices can't carry call media;
+ *  offer/ringing/accept/terminate drive the incoming-call overlay and the
+ *  transcript call-log entries */
+export interface CallInfo {
+  id: string
+  chatId: Id
+  from: Id
+  video: boolean
+  group: boolean
+  status: 'offer' | 'ringing' | 'preaccept' | 'transport' | 'relaylatency' | 'timeout' | 'reject' | 'accept' | 'terminate' | string
+  date: number
+  /** replayed while we were offline — never pop an overlay for these */
+  offline: boolean
+}
+
 export interface ReplyRef {
   id: Id
   from: Id | 'me'
@@ -156,6 +171,7 @@ export type ServerEvent =
   | { type: 'older_result'; chatId: Id; count: number; hasMore: boolean }
   | { type: 'sync_progress'; chats: number; contacts: number; messages: number; progress?: number | null; done?: boolean }
   | { type: 'profile'; profile: ProfileInfo }
+  | { type: 'call'; call: CallInfo }
   /** a command failed at the bridge — the UI surfaces it as a toast */
   | { type: 'bridge_error'; message: string }
 
@@ -219,6 +235,8 @@ export interface ClientAdapter {
   groupEdit?(chatId: Id, p: { subject?: string; description?: string }): void
   /** create a group; resolves to the new chat id */
   createGroup?(subject: string, participantJids: Id[]): Promise<{ chatId?: Id; error?: string }>
+  /** decline a ringing call — real protocol action */
+  rejectCall?(callId: string, callFrom: Id): Promise<void>
   storageStats?(): Promise<{ bytes: number; files: number }>
   clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void

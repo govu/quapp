@@ -7,7 +7,7 @@ import {
 import type { Chat } from '../bridge/types'
 import { cx, listTime, sameDay, spring, timeLabel } from '../lib/util'
 import {
-  clearSelection, confirmClearChat, confirmDeleteChat, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, toast, useStore,
+  clearSelection, confirmClearChat, confirmDeleteChat, doCallHandoff, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { MessageList } from './MessageList'
@@ -145,8 +145,8 @@ function Header({ chat }: { chat: Chat }) {
       <div className="no-drag ml-auto flex items-center gap-0.5">
         {chat.kind !== 'channel' && chat.kind !== 'saved' && (
           <>
-            <IconBtn label="Voice call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')}><Phone size={19} /></IconBtn>
-            <IconBtn label="Video call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')}><VideoCamera size={21} /></IconBtn>
+            <IconBtn label="Voice call" onClick={() => doCallHandoff(chat.id, false)}><Phone size={19} /></IconBtn>
+            <IconBtn label="Video call" onClick={() => doCallHandoff(chat.id, true)}><VideoCamera size={21} /></IconBtn>
           </>
         )}
         <IconBtn label="Search in chat" active={pane === 'search'} onClick={() => setPane(pane === 'search' ? null : 'search')}>

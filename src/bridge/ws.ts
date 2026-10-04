@@ -174,6 +174,7 @@ export class WsAdapter implements ClientAdapter {
   createGroup(subject: string, participantJids: Id[]) {
     return this.call<{ chatId?: Id; error?: string }>('createGroup', { subject, participantJids })
   }
+  rejectCall(callId: string, callFrom: Id) { return this.call<void>('rejectCall', { callId, callFrom }) }
   download(chatId: Id, messageId: Id) {
     return this.call<{ path?: string; error?: string }>('download', { chatId, messageId })
   }

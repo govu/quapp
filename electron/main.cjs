@@ -105,9 +105,6 @@ function createWindow() {
     // to the opaque backgroundColor elsewhere)
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: '#00000000', symbolColor: '#8e8e93', height: 40 },
-    ...(process.platform === 'win32' && parseInt(process.versions.electron) >= 25 && require('node:os').release() >= '10.0.22000'
-      ? { backgroundMaterial: 'mica' }
-      : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -118,9 +115,12 @@ function createWindow() {
 
   win.once('ready-to-show', () => win.show())
 
-  // links (previews, attached urls) open in the system browser
+  // links (previews, attached urls) open in the system browser; whatsapp://
+  // hands voice/video calls to the official app — linked devices can't carry
+  // call media, so the phone/official client completes the call
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url) && !url.startsWith('http://127.0.0.1:8766')) shell.openExternal(url)
+    else if (/^whatsapp:/.test(url)) shell.openExternal(url).catch(() => {})
     return { action: 'deny' }
   })
   // navigation is allowed only to the app's own entry point (and the dev
@@ -144,11 +144,7 @@ function createWindow() {
   if (isDev) void win.loadURL(DEV_URL)
   else void daemonToken().then((token) =>
     win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
-      query: {
-        token,
-        // let the renderer relax its sidebar material when real Mica is behind it
-        mica: win.getBackgroundMaterial?.() === 'mica' ? '1' : '0',
-      },
+      query: { token },
     }),
   )
 }
