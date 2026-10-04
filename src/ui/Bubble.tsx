@@ -212,7 +212,10 @@ function ImageContent({ m }: { m: Message }) {
       <button
         onClick={() => { if (fail < 2 && !useStore.getState().selection) setOpen(true) }}
         className="relative block overflow-hidden rounded-[10px] bg-[var(--fill-3)]"
-        style={{ aspectRatio: ar, width: '100%', maxWidth: 320 }}
+        // width must be definite — bare '100%' inside a shrink-wrap bubble
+        // resolves to ~0 and the media box collapses into a sliver; the
+        // min-width floor breaks the cycle (parent can only grow to it)
+        style={{ aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320 }}
         aria-label="Open image"
       >
         {fail < 2 && (
@@ -253,7 +256,7 @@ function VideoContent({ m }: { m: Message }) {
   const ar = c.w && c.h ? Math.min(Math.max(c.w / c.h, 0.6), 2.2) : 16 / 9
   return (
     <div>
-      <div className="relative overflow-hidden rounded-[10px] bg-black" style={{ aspectRatio: ar, maxWidth: 320 }}>
+      <div className="relative overflow-hidden rounded-[10px] bg-black" style={{ aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320 }}>
         {playing ? (
           <video
             src={c.url}
