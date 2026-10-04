@@ -1,0 +1,389 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Segoe UI Variable Text", "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
+}
+
+/*
+  Quapp design tokens — Apple HIG palette.
+  Semantic tokens swap under .dark; components never hardcode grays.
+*/
+:root {
+  /* system colors */
+  --blue: #007aff;
+  --green: #34c759;
+  --red: #ff3b30;
+  --orange: #ff9500;
+  --tick-read: #53bdeb;
+
+  /* labels */
+  --label: #000000;
+  --label-2: rgba(60, 60, 67, 0.6);
+  --label-3: rgba(60, 60, 67, 0.33);
+  --label-4: rgba(60, 60, 67, 0.18);
+
+  /* fills (quaternary→primary, Apple order) */
+  --fill: rgba(120, 120, 128, 0.16);
+  --fill-2: rgba(120, 120, 128, 0.12);
+  --fill-3: rgba(118, 118, 128, 0.08);
+  --fill-4: rgba(116, 116, 128, 0.06);
+
+  /* backgrounds */
+  --bg: #ffffff;
+  --bg-grouped: #f2f2f7;
+  --bg-grouped-2: #ffffff;
+  --sidebar: rgba(244, 244, 246, 0.72);
+  --sidebar-solid: #f4f4f6;
+  --chrome: rgba(249, 249, 251, 0.78);
+  --separator: rgba(60, 60, 67, 0.1);
+  --separator-strong: rgba(60, 60, 67, 0.17);
+
+  /* bubbles — iMessage */
+  --bubble-in: #e9e9eb;
+  --bubble-in-text: #000000;
+  --bubble-out-a: #24a2ff;
+  --bubble-out-b: #0a6ff5;
+  --bubble-meta-in: rgba(0, 0, 0, 0.45);
+  --bubble-meta-out: rgba(255, 255, 255, 0.72);
+
+  /* composer / fields */
+  --field: #ffffff;
+  --field-border: rgba(60, 60, 67, 0.16);
+
+  /* menu material */
+  --menu: rgba(250, 250, 252, 0.82);
+  --menu-border: rgba(0, 0, 0, 0.08);
+
+  /* selection */
+  --row-selected: rgba(0, 122, 255, 0.16);
+  --row-hover: rgba(120, 120, 128, 0.09);
+
+  /* wallpaper */
+  --wall: #efeae2;
+  --wall-pattern: rgba(60, 60, 67, 0.05);
+
+  /* easing */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+  color-scheme: light;
+}
+
+.dark {
+  --blue: #0a84ff;
+  --green: #30d158;
+  --red: #ff453a;
+  --orange: #ff9f0a;
+  --tick-read: #53bdeb;
+
+  --label: #ffffff;
+  --label-2: rgba(235, 235, 245, 0.6);
+  --label-3: rgba(235, 235, 245, 0.33);
+  --label-4: rgba(235, 235, 245, 0.18);
+
+  --fill: rgba(120, 120, 128, 0.24);
+  --fill-2: rgba(120, 120, 128, 0.18);
+  --fill-3: rgba(118, 118, 128, 0.14);
+  --fill-4: rgba(118, 118, 128, 0.1);
+
+  --bg: #1c1c1e;
+  --bg-grouped: #000000;
+  --bg-grouped-2: #1c1c1e;
+  --sidebar: rgba(30, 30, 32, 0.62);
+  --sidebar-solid: #1e1e20;
+  --chrome: rgba(28, 28, 30, 0.72);
+  --separator: rgba(84, 84, 88, 0.32);
+  --separator-strong: rgba(84, 84, 88, 0.55);
+
+  --bubble-in: #2a2a2d;
+  --bubble-in-text: #ffffff;
+  --bubble-out-a: #0f92ff;
+  --bubble-out-b: #0a6ae8;
+  --bubble-meta-in: rgba(235, 235, 245, 0.45);
+  --bubble-meta-out: rgba(255, 255, 255, 0.72);
+
+  --field: #2c2c2e;
+  --field-border: rgba(84, 84, 88, 0.5);
+
+  --menu: rgba(44, 44, 48, 0.86);
+  --menu-border: rgba(255, 255, 255, 0.09);
+
+  --row-selected: rgba(10, 132, 255, 0.28);
+  --row-hover: rgba(120, 120, 128, 0.14);
+
+  --wall: #0b0b0d;
+  --wall-pattern: rgba(235, 235, 245, 0.045);
+
+  color-scheme: dark;
+}
+
+/* ---------- accents — retint --blue, outgoing bubbles, selection ---------- */
+/* each block sets light values; .dark[data-accent] overrides */
+:root[data-accent='green'] {
+  --blue: #28bd4b;
+  --bubble-out-a: #33ce58;
+  --bubble-out-b: #1fa643;
+  --tick-read: #b8f5c5;
+  --row-selected: rgba(40, 189, 75, 0.15);
+}
+.dark[data-accent='green'] {
+  --blue: #30d158;
+  --bubble-out-a: #34d164;
+  --bubble-out-b: #26b04f;
+  --tick-read: #b8f5c5;
+  --row-selected: rgba(48, 209, 88, 0.24);
+}
+:root[data-accent='purple'] {
+  --blue: #a64ce8;
+  --bubble-out-a: #b45de0;
+  --bubble-out-b: #9338d0;
+  --tick-read: #e8c8ff;
+  --row-selected: rgba(166, 76, 232, 0.15);
+}
+.dark[data-accent='purple'] {
+  --blue: #bf5af2;
+  --bubble-out-a: #c468f5;
+  --bubble-out-b: #a845dd;
+  --tick-read: #eccdff;
+  --row-selected: rgba(191, 90, 242, 0.26);
+}
+:root[data-accent='pink'] {
+  --blue: #f52f57;
+  --bubble-out-a: #ff4d6f;
+  --bubble-out-b: #e81f47;
+  --tick-read: #ffc9d4;
+  --row-selected: rgba(245, 47, 87, 0.14);
+}
+.dark[data-accent='pink'] {
+  --blue: #ff375f;
+  --bubble-out-a: #ff5477;
+  --bubble-out-b: #e52a4f;
+  --tick-read: #ffc9d4;
+  --row-selected: rgba(255, 55, 95, 0.26);
+}
+:root[data-accent='orange'] {
+  --blue: #f58a00;
+  --bubble-out-a: #ffa31a;
+  --bubble-out-b: #ee8200;
+  --tick-read: #ffe1b3;
+  --row-selected: rgba(245, 138, 0, 0.15);
+}
+.dark[data-accent='orange'] {
+  --blue: #ff9f0a;
+  --bubble-out-a: #ffac26;
+  --bubble-out-b: #f08c00;
+  --tick-read: #ffe1b3;
+  --row-selected: rgba(255, 159, 10, 0.26);
+}
+:root[data-accent='teal'] {
+  --blue: #1f9db3;
+  --bubble-out-a: #30b9d1;
+  --bubble-out-b: #128fa6;
+  --tick-read: #bdf0fa;
+  --row-selected: rgba(31, 157, 179, 0.15);
+}
+.dark[data-accent='teal'] {
+  --blue: #40c8e0;
+  --bubble-out-a: #4acfe6;
+  --bubble-out-b: #20a6bd;
+  --tick-read: #c9f2fa;
+  --row-selected: rgba(64, 200, 224, 0.24);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  color: var(--label);
+  background: var(--bg-grouped);
+  overflow: hidden;
+  font-size: 15px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fill) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--fill);
+  border-radius: 8px;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--blue) 28%, transparent);
+}
+.dark ::selection {
+  background: color-mix(in srgb, var(--blue) 40%, transparent);
+}
+
+/* ---------- materials ---------- */
+.vibrancy {
+  background: var(--sidebar);
+  backdrop-filter: blur(32px) saturate(190%);
+  -webkit-backdrop-filter: blur(32px) saturate(190%);
+}
+.chrome {
+  background: var(--chrome);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+}
+.menu-material {
+  background: var(--menu);
+  backdrop-filter: blur(28px) saturate(180%);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  border: 0.5px solid var(--menu-border);
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.04),
+    0 12px 40px rgba(0, 0, 0, 0.18),
+    0 2px 8px rgba(0, 0, 0, 0.1);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .vibrancy { background: var(--sidebar-solid); }
+  .chrome { background: var(--bg); }
+  .menu-material { background: var(--bg); }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .vibrancy { background: var(--sidebar-solid); backdrop-filter: none; }
+  .chrome { background: var(--bg); backdrop-filter: none; }
+  .menu-material { background: var(--bg); backdrop-filter: none; }
+}
+
+.hairline-b { box-shadow: inset 0 -0.5px 0 var(--separator); }
+.hairline-t { box-shadow: inset 0 0.5px 0 var(--separator); }
+.hairline-r { box-shadow: inset -0.5px 0 0 var(--separator); }
+
+/* ---------- press feedback ---------- */
+.press {
+  transition:
+    transform 120ms var(--ease-out),
+    opacity 120ms var(--ease-out),
+    background-color 140ms var(--ease-out),
+    color 140ms var(--ease-out),
+    filter 160ms var(--ease-out);
+}
+.press:active {
+  transform: scale(0.96);
+}
+@media (hover: none) {
+  .press:active { transform: scale(0.97); }
+}
+
+/* ---------- bubbles ---------- */
+.bubble-out {
+  background: linear-gradient(180deg, var(--bubble-out-a) 0%, var(--bubble-out-b) 100%);
+  color: #fff;
+}
+.bubble-in {
+  background: var(--bubble-in);
+  color: var(--bubble-in-text);
+}
+.tail-out { color: var(--bubble-out-b); }
+.tail-in { color: var(--bubble-in); }
+
+/* unread divider + day pill */
+.pill {
+  background: var(--chrome);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow:
+    0 0 0 0.5px var(--separator),
+    0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+/* wallpaper */
+.wall-default { background: var(--wall); }
+.wall-pattern {
+  background-color: var(--wall);
+  background-image: radial-gradient(var(--wall-pattern) 1px, transparent 1.4px);
+  background-size: 22px 22px;
+}
+.wall-dusk {
+  background:
+    radial-gradient(120% 90% at 15% 0%, rgba(0, 122, 255, 0.10) 0%, transparent 55%),
+    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.10) 0%, transparent 55%),
+    var(--wall);
+}
+.dark .wall-dusk {
+  background:
+    radial-gradient(120% 90% at 15% 0%, rgba(10, 132, 255, 0.12) 0%, transparent 55%),
+    radial-gradient(110% 80% at 85% 100%, rgba(94, 92, 230, 0.12) 0%, transparent 55%),
+    var(--wall);
+}
+.wall-none { background: var(--bg-grouped); }
+
+/* message flash on jump-to-result */
+@keyframes msgflash {
+  0% { background-color: color-mix(in srgb, var(--blue) 22%, transparent); }
+  100% { background-color: transparent; }
+}
+.msg-flash {
+  animation: msgflash 1.6s var(--ease-out) both;
+  border-radius: 14px;
+}
+
+/* search highlight */
+mark {
+  background: rgba(255, 214, 0, 0.45);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.dark mark { background: rgba(255, 214, 10, 0.35); }
+
+/* typing dots */
+@keyframes tdots {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+.tdot { animation: tdots 1.2s infinite; }
+.tdot:nth-child(2) { animation-delay: 0.15s; }
+.tdot:nth-child(3) { animation-delay: 0.3s; }
+
+/* emoji-only messages get bigger */
+.emoji-xl { font-size: 44px; line-height: 1.15; letter-spacing: 0.02em; }
+
+/* link colors inside bubbles */
+.bubble-in a { color: var(--blue); }
+.bubble-out a { color: #fff; text-decoration: underline; }
+
+/* focus ring — Apple style, only for keyboard */
+:focus { outline: none; }
+.focus-ring:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+  border-radius: 8px;
+}
+
+input[type="text"], input[type="search"], textarea {
+  font: inherit;
+}
+
+/* reduced motion: keep opacity feedback, kill movement */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

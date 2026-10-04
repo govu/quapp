@@ -1,0 +1,48 @@
+{
+  "name": "quapp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Fast, native-feeling WhatsApp desktop client",
+  "author": "bflp",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "quappd": "node bridge/src/quappd.mjs",
+    "bridge": "esbuild bridge/src/quappd.mjs --bundle --platform=node --format=cjs --target=node20 --outfile=bridge/dist/quappd.cjs --external:sharp --external:jimp --external:canvas --external:link-preview-js --external:qrcode-terminal --external:audio-decode --external:music-metadata --external:bufferutil --external:utf-8-validate",
+    "desktop": "pnpm build && pnpm bridge && electron .",
+    "desktop:dev": "pnpm bridge && electron . --dev",
+    "dist": "pnpm build && pnpm bridge && electron-builder",
+    "dist:dir": "pnpm build && pnpm bridge && electron-builder --dir"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/react-virtual": "^3.14.13",
+    "motion": "^14.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwindcss": "^4.3.3",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.1",
+    "@whiskeysockets/baileys": "^6.7.24",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "oxlint": "^1.81.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "ws": "^8.22.0"
+  }
+}

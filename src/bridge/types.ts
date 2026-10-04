@@ -1,0 +1,172 @@
+// Protocol types — the contract between the UI and any backend.
+// A backend can be the DemoAdapter (local simulation) or the quappd
+// bridge over whatsapp-rust. The UI never sees a protobuf.
+
+export type Id = string
+
+export type ChatKind = 'dm' | 'group' | 'channel' | 'saved'
+export type Delivery = 'pending' | 'sent' | 'delivered' | 'read' | 'failed'
+
+export interface Account {
+  id: Id
+  name: string
+  phone?: string
+  avatarHue: number
+  avatarUrl?: string
+  unreadTotal: number
+}
+
+export interface Contact {
+  id: Id
+  name: string
+  firstName?: string
+  about?: string
+  phone?: string
+  avatarHue: number
+  avatarUrl?: string
+  verified?: boolean
+  blocked?: boolean
+}
+
+export interface Chat {
+  id: Id
+  kind: ChatKind
+  title: string
+  avatarHue: number
+  avatarUrl?: string
+  participants: Id[]
+  /** sender id -> display name inside this chat (groups) */
+  pinned: boolean
+  muted: boolean
+  archived: boolean
+  favorite: boolean
+  /** unread count; markedUnread shows the hollow dot */
+  unread: number
+  markedUnread: boolean
+  lastActivity: number
+  draft?: string
+  /** id of pinned message, if the chat has one */
+  pinnedMessageId?: Id
+  ephemeral?: boolean
+  youAdmin?: boolean
+  contactId?: Id
+}
+
+export interface LinkPreview {
+  url: string
+  title: string
+  description?: string
+  site?: string
+}
+
+export type MsgContent =
+  | { kind: 'text'; text: string; linkPreview?: LinkPreview }
+  | { kind: 'image'; url: string; w: number; h: number; caption?: string }
+  | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number }
+  | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; file?: string }
+  | { kind:'document'; name: string; size: number; mime: string; pages?: number }
+  | { kind: 'sticker'; emoji: string }
+  | { kind: 'poll'; question: string; options: { text: string; votes: number }[]; multi: boolean; voted?: number[] }
+  | { kind: 'location'; name: string; address?: string }
+  | { kind: 'system'; text: string }
+  | { kind: 'deleted' }
+
+export interface ReplyRef {
+  id: Id
+  from: Id | 'me'
+  fromName: string
+  preview: string
+  kind: MsgContent['kind']
+}
+
+export interface Reaction {
+  emoji: string
+  by: Id | 'me'
+}
+
+export interface Message {
+  id: Id
+  chatId: Id
+  from: Id | 'me'
+  /** display name for group senders */
+  fromName?: string
+  ts: number
+  delivery?: Delivery
+  edited?: boolean
+  forwarded?: boolean
+  starred?: boolean
+  replyTo?: ReplyRef
+  reactions?: Reaction[]
+  content: MsgContent
+  /** bumped by the store when any field changes, for memoized rows */
+  v?: number
+}
+
+export interface MessagePage {
+  messages: Message[]
+  hasMore: boolean
+}
+
+export interface SearchHit {
+  messageId: Id
+  chatId: Id
+}
+
+export type OutContent =
+  | { kind: 'text'; text: string }
+  | { kind: 'audio'; duration: number; waveform: number[]; voice: true; url?: string; dataUrl?: string }
+  | { kind: 'document'; name: string; size: number; mime: string; url?: string; dataUrl?: string }
+  | { kind: 'image'; url: string; w: number; h: number; caption?: string }
+  | { kind: 'video'; url: string; w: number; h: number; caption?: string }
+  | { kind: 'poll'; question: string; options: { text: string; votes: number }[]; multi: boolean }
+
+// ---- events pushed from a backend to the store ----
+export type ServerEvent =
+  | { type: 'message'; msg: Message }
+  | { type: 'message_update'; msg: Message }
+  | { type: 'messages_removed'; chatId: Id; ids: Id[] }
+  | { type: 'delivery'; chatId: Id; ids: Id[]; delivery: Delivery }
+  | { type: 'chat_update'; chat: Chat }
+  | { type: 'typing'; chatId: Id; names: string[] }
+  | { type: 'linked'; account: Account }
+  | { type: 'presence'; chatId: Id; online: boolean; lastSeen?: number }
+  /** real pairing QR payload from the bridge — render it for the user to scan */
+  | { type: 'qr'; qr: string }
+  | { type: 'connection'; state: 'open' | 'closed' }
+  | { type: 'history_done' }
+
+// ---- the adapter the store drives ----
+export interface Snapshot {
+  account: Account
+  chats: Chat[]
+  contacts: Contact[]
+  /** initial pages for the most recent chats, keyed by chat id */
+  topMessages: Record<Id, Message[]>
+}
+
+export interface ClientAdapter {
+  /** true for the local simulation — lets the UI show demo affordances */
+  readonly isDemo?: boolean
+  /** resolves once the device is linked + history is loaded */
+  connect(): Promise<Snapshot>
+  loadOlder(chatId: Id, beforeTs: number, limit: number): Promise<MessagePage>
+  searchMessages(chatId: Id, query: string): Promise<Message[]>
+  send(chatId: Id, content: OutContent, replyTo?: ReplyRef): void
+  edit(chatId: Id, messageId: Id, text: string): void
+  delete(chatId: Id, messageIds: Id[], forEveryone: boolean): void
+  react(chatId: Id, messageId: Id, emoji: string | null): void
+  forward(toChatIds: Id[], messageIds: Id[]): void
+  /** star/unstar messages; reflected through message_update events */
+  star(chatId: Id, messageIds: Id[], starred: boolean): void
+  /** cross-chat message search — every chat at once */
+  searchAll(query: string): Promise<Message[]>
+  /** open (or create) the dm for a contact; returns the chat */
+  openChat(contactId: Id): Promise<Chat>
+  markRead(chatId: Id): void
+  markUnread(chatId: Id, value: boolean): void
+  setTyping(chatId: Id, typing: boolean): void
+  setChatFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', value: boolean): void
+  vote(chatId: Id, messageId: Id, optionIndexes: number[]): void
+  onEvent(cb: (e: ServerEvent) => void): () => void
+  dispose(): void
+}

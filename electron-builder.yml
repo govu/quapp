@@ -1,0 +1,42 @@
+appId: com.quapp.app
+productName: Quapp
+copyright: Copyright © 2026
+
+directories:
+  output: release
+  buildResources: build
+
+# pre-extracted electron dist — avoids the extract+rename step that
+# Windows Defender locks on some machines (EPERM rename win-unpacked.tmp)
+electronDist: electron-dist
+
+# no native modules — skip the internal npm/pnpm install step
+npmRebuild: false
+
+asarUnpack:
+  - bridge/dist/**
+
+files:
+  - dist/**
+  - electron/**
+  - bridge/dist/**
+  - build/icon.png
+  - package.json
+  - "!**/*.map"
+
+win:
+  target:
+    - nsis
+    - portable
+  icon: build/icon.png
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Quapp
+
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}

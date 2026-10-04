@@ -1,0 +1,15 @@
+allowBuilds:
+  '@whiskeysockets/baileys': set this to true or false
+  esbuild: set this to true or false
+  protobufjs: set this to true or false
+
+onlyBuiltDependencies:
+  - electron
+  - electron-winstaller
+  - '@whiskeysockets/baileys'
+  - esbuild
+  - protobufjs
+  - sharp
+
+overrides:
+  libsignal: npm:libsignal-node@2.0.1
