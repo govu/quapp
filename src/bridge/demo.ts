@@ -294,6 +294,16 @@ export class DemoAdapter implements ClientAdapter {
     }, 600)
   }
 
+  pinMessage(chatId: Id, messageId: Id, pin: boolean) {
+    const c = this.chats.get(chatId)
+    if (c) { c.pinnedMessageId = pin ? messageId : undefined; this.emit({ type: 'chat_update', chat: c }) }
+  }
+  async leaveGroup(_chatId: Id) { /* demo */ }
+  setPrivacy(_setting: string, _value: string) { /* demo */ }
+  async blocklist() { return [] }
+  async storageStats() { return { bytes: 182_000_000, files: 412 } }
+  async clearCache() { return 96_000_000 }
+
   onEvent(cb: (e: ServerEvent) => void) {
     this.cbs.add(cb)
     return () => this.cbs.delete(cb)

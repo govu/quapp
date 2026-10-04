@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from '../store'
 import { motion, AnimatePresence } from 'motion/react'
 import {
-  ArrowUp, Camera, FileArrowUp, Image as ImageIcon, Microphone,
+  ArrowUp, FileArrowUp, Image as ImageIcon, Microphone,
   Plus, Smiley, X,
 } from '@phosphor-icons/react'
 import type { Chat } from '../bridge/types'
@@ -65,11 +65,10 @@ function EmojiPicker({ onPick, onClose }: { onPick: (e: string) => void; onClose
 }
 
 // ---------- attach sheet ----------
-function AttachMenu({ onPick, onClose }: { onPick: (kind: 'image' | 'doc' | 'camera') => void; onClose: () => void }) {
+function AttachMenu({ onPick, onClose }: { onPick: (kind: 'image' | 'doc') => void; onClose: () => void }) {
   const items = [
-    { icon: <ImageIcon size={20} />, label: 'Photos', sub: 'Send images', k: 'image' as const },
-    { icon: <FileArrowUp size={20} />, label: 'Document', sub: 'Any file', k: 'doc' as const },
-    { icon: <Camera size={20} />, label: 'Camera', sub: 'Take a photo', k: 'camera' as const },
+    { icon: <ImageIcon size={20} />, label: 'Photos & videos', sub: 'Send images or clips', k: 'image' as const },
+    { icon: <FileArrowUp size={20} />, label: 'Document', sub: 'Any file type', k: 'doc' as const },
   ]
   return (
     <motion.div
@@ -247,14 +246,17 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
     requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(s + e.length, s + e.length) })
   }
 
-  const attach = (kind: 'image' | 'doc' | 'camera') => {
-    fileMode.current = kind === 'doc' ? 'doc' : 'image'
+  const attach = (kind: 'image' | 'doc') => {
+    fileMode.current = kind
     fileRef.current?.click()
   }
 
-  const onFile = (f: File | undefined) => {
-    if (!f) return
-    if (f.size > 256 * 1024 * 1024) { toast('File is too large', 'error'); return }
+  const onFiles = (files: FileList | null) => {
+    for (const f of Array.from(files ?? [])) onFile(f)
+  }
+
+  const onFile = (f: File) => {
+    if (f.size > 256 * 1024 * 1024) { toast(`"${f.name}" is too large (256 MB max)`, 'error'); return }
     const rd = new FileReader()
     rd.onload = () => {
       const url = String(rd.result)
@@ -294,7 +296,9 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
           ref={fileRef}
           type="file"
           className="hidden"
-          onChange={(e) => { onFile(e.target.files?.[0]); e.target.value = '' }}
+          multiple
+          accept={fileMode.current === 'image' ? 'image/*,video/*' : undefined}
+          onChange={(e) => { onFiles(e.target.files); e.target.value = '' }}
         />
         <button
           onClick={() => setPicker(picker === 'attach' ? 'none' : 'attach')}
@@ -369,21 +373,86 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
   )
 })
 
-// ---------- voice recording overlay ----------
+// ---------- voice recording overlay (real MediaRecorder) ----------
 function RecorderOverlay({ chat, onDone }: { chat: Chat; onDone: () => void }) {
   const [sec, setSec] = useState(0)
   const [wave, setWave] = useState<number[]>([])
+  const recRef = useRef<MediaRecorder | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const chunksRef = useRef<Blob[]>([])
+  const cancelled = useRef(false)
+  const waveRef = useRef<number[]>([])
+
   useEffect(() => {
-    const t = setInterval(() => {
-      setSec((s) => s + 1)
-      setWave((w) => [...w.slice(-46), 4 + Math.random() * 15])
-    }, 220)
-    return () => clearInterval(t)
+    let alive = true
+    let tick: ReturnType<typeof setInterval>
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        if (!alive) { stream.getTracks().forEach((t) => t.stop()); return }
+        streamRef.current = stream
+        const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
+          : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus'
+          : ''
+        const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
+        recRef.current = rec
+        chunksRef.current = []
+        rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data) }
+        rec.start(200)
+        // live waveform from the analyser
+        const ctx = new AudioContext()
+        const src = ctx.createMediaStreamSource(stream)
+        const an = ctx.createAnalyser()
+        an.fftSize = 256
+        src.connect(an)
+        const buf = new Uint8Array(an.frequencyBinCount)
+        tick = setInterval(() => {
+          setSec((s) => s + 1)
+          an.getByteTimeDomainData(buf)
+          let peak = 0
+          for (const v of buf) peak = Math.max(peak, Math.abs(v - 128))
+          const h = 4 + (peak / 128) * 20
+          waveRef.current = [...waveRef.current.slice(-46), h]
+          setWave(waveRef.current)
+        }, 220)
+      })
+      .catch(() => {
+        toast('Microphone unavailable — check Windows permissions', 'error')
+        onDone()
+      })
+    return () => {
+      alive = false
+      clearInterval(tick)
+      cancelled.current = true
+      recRef.current?.state !== 'inactive' && recRef.current?.stop()
+      streamRef.current?.getTracks().forEach((t) => t.stop())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
   const finish = (sendIt: boolean) => {
-    if (sendIt) send(chat.id, { kind: 'audio', duration: Math.max(1, sec), waveform: wave.length ? wave : [4, 8, 6, 10], voice: true })
+    const rec = recRef.current
+    if (!sendIt || !rec || chunksRef.current.length === 0) {
+      onDone()
+      return
+    }
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: rec.mimeType || 'audio/webm' })
+      const rd = new FileReader()
+      rd.onload = () => {
+        send(chat.id, {
+          kind: 'audio',
+          duration: Math.max(1, sec),
+          waveform: waveRef.current.length ? waveRef.current.map((v) => Math.round(v)) : [4, 8, 6, 10],
+          voice: true,
+          url: String(rd.result),
+        })
+      }
+      rd.readAsDataURL(blob)
+    }
+    rec.stop()
     onDone()
   }
+
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -402,6 +471,7 @@ function RecorderOverlay({ chat, onDone }: { chat: Chat; onDone: () => void }) {
         {wave.map((v, i) => (
           <span key={i} className="w-[3px] rounded-full bg-[var(--blue)]" style={{ height: v }} />
         ))}
+        {!wave.length && <span className="text-[12px] text-[var(--label-3)]">Listening…</span>}
       </div>
       <button onClick={() => finish(true)} className="press grid size-[34px] place-items-center rounded-full bg-[var(--blue)] text-white" aria-label="Send voice message">
         <ArrowUp size={18} weight="bold" />

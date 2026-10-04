@@ -22,6 +22,16 @@ export interface Settings {
   readReceipts: boolean
   linkPreviews: boolean
   animLevel: 'full' | 'reduced'
+  /** desktop notifications + sound */
+  notifications: boolean
+  notifPreview: boolean
+  notifSound: boolean
+  autoDlPhotos: boolean
+  autoDlDocs: boolean
+  /** WhatsApp-side privacy values, mirrored to the phone on change */
+  privLastSeen: 'everyone' | 'contacts' | 'nobody'
+  privPhoto: 'everyone' | 'contacts' | 'nobody'
+  privGroups: 'everyone' | 'contacts' | 'nobody'
 }
 
 interface ChatBucket {
@@ -64,6 +74,8 @@ interface State {
   demoMode: boolean
   /** confirm sheet: link a different account (replaces current session) */
   relinkPrompt: boolean
+  /** unread count captured when the active chat was opened — survives markRead */
+  openUnread: number
 }
 
 let toastId = 0
@@ -88,6 +100,14 @@ function loadSettings(): Settings {
     readReceipts: true,
     linkPreviews: true,
     animLevel: 'full',
+    notifications: true,
+    notifPreview: true,
+    notifSound: true,
+    autoDlPhotos: true,
+    autoDlDocs: false,
+    privLastSeen: 'contacts',
+    privPhoto: 'everyone',
+    privGroups: 'contacts',
   }
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
@@ -126,6 +146,7 @@ export const useStore = create<State>(() => ({
   bridgeStatus: 'idle',
   demoMode: true,
   relinkPrompt: false,
+  openUnread: 0,
   settings: loadSettings(),
 }))
 
@@ -140,9 +161,74 @@ export function toast(text: string, icon: Toast['icon'] = 'info') {
   setTimeout(() => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), 3200)
 }
 
+// ---------- desktop notifications ----------
+
+let notifAllowed: NotificationPermission | 'unsupported' = 'default'
+function ensureNotifPermission() {
+  if (typeof Notification === 'undefined') { notifAllowed = 'unsupported'; return }
+  if (notifAllowed !== 'granted' && notifAllowed !== 'denied')
+    void Notification.requestPermission().then((p) => { notifAllowed = p })
+}
+
+let audioCtx: AudioContext | null = null
+function notifBlip() {
+  try {
+    audioCtx ??= new AudioContext()
+    const t = audioCtx.currentTime
+    const osc = audioCtx.createOscillator()
+    const gain = audioCtx.createGain()
+    osc.type = 'sine'
+    osc.frequency.setValueAtTime(1046, t) // C6 — short two-tone blip
+    osc.frequency.setValueAtTime(1318, t + 0.07)
+    gain.gain.setValueAtTime(0.0001, t)
+    gain.gain.exponentialRampToValueAtTime(0.08, t + 0.012)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.22)
+    osc.connect(gain).connect(audioCtx.destination)
+    osc.start(t); osc.stop(t + 0.24)
+  } catch { /* no audio device */ }
+}
+
+function notifyMessage(msg: Message) {
+  const { settings, activeChat, chats } = get()
+  if (!settings.notifications || notifAllowed === 'denied' || notifAllowed === 'unsupported') return
+  const chat = chats.get(msg.chatId)
+  if (chat?.muted) return
+  const focused = document.hasFocus() && activeChat === msg.chatId
+  if (!focused && settings.notifSound) notifBlip()
+  if (focused || notifAllowed !== 'granted') return
+  const sender = chat?.kind === 'group' && msg.fromName ? `${chat.title} — ${msg.fromName}` : (chat?.title ?? msg.fromName ?? 'Quapp')
+  const preview = settings.notifPreview ? previewText(msg) : 'New message'
+  const n = new Notification(sender, { body: preview, tag: `quapp-${msg.chatId}`, icon: chat?.avatarUrl })
+  n.onclick = () => { window.focus(); openChat(msg.chatId) }
+}
+
+function previewText(m: Message): string {
+  const c = m.content
+  switch (c.kind) {
+    case 'text': return c.text.slice(0, 140)
+    case 'image': return c.caption ? `📷 ${c.caption}` : '📷 Photo'
+    case 'video': return '🎬 Video'
+    case 'audio': return c.voice ? '🎤 Voice message' : '🎵 Audio'
+    case 'document': return `📄 ${c.name}`
+    case 'sticker': return `Sticker ${c.emoji}`
+    case 'poll': return `📊 ${c.question}`
+    case 'location': return '📍 Location'
+    default: return 'New message'
+  }
+}
+
+// unread badge in the window title — updates whenever the chat map changes
+function updateTitle(chats: Map<Id, Chat>) {
+  const n = [...chats.values()].reduce((a, c) => a + (!c.archived && !c.muted ? c.unread + (c.markedUnread ? 1 : 0) : 0), 0)
+  document.title = n ? `(${n}) Quapp` : 'Quapp'
+}
+useStore.subscribe((s, prev) => {
+  if (s.chats !== prev.chats) updateTitle(s.chats)
+})
+
 // ---------- event application ----------
 
-function upsertMessage(msg: Message) {
+function upsertMessage(msg: Message, backfill = false) {
   const { buckets, chats } = get()
   const b = buckets.get(msg.chatId)
   if (b) {
@@ -159,11 +245,25 @@ function upsertMessage(msg: Message) {
     nbuckets.set(msg.chatId, { ids: [msg.id], map: new Map([[msg.id, { ...msg, v: 1 }]]), hasMore: false, loaded: true })
     set({ buckets: nbuckets })
   }
-  const c = chats.get(msg.chatId)
+  if (!chats.get(msg.chatId)) {
+    // message for a chat the snapshot never sent — create a placeholder row;
+    // the daemon's chat_update will fill in name/avatar when meta lands
+    const isGroup = msg.chatId.endsWith('@g.us')
+    const c0: Chat = {
+      id: msg.chatId, kind: isGroup ? 'group' : 'dm', title: msg.chatId.split('@')[0],
+      avatarHue: Math.abs([...msg.chatId].reduce((a, c) => a + c.charCodeAt(0), 0)) % 360,
+      participants: [], pinned: false, muted: false, archived: false, favorite: false,
+      unread: 0, markedUnread: false, lastActivity: msg.ts,
+    }
+    const nc = new Map(chats)
+    nc.set(msg.chatId, c0)
+    set({ chats: nc, order: sortChats(nc) })
+  }
+  const c = useStore.getState().chats.get(msg.chatId)
   if (c && msg.ts >= c.lastActivity) {
     const nc = new Map(chats)
     const isActive = get().activeChat === msg.chatId
-    const inc = msg.from !== 'me' && !isActive ? 1 : 0
+    const inc = msg.from !== 'me' && !isActive && !backfill ? 1 : 0
     nc.set(msg.chatId, { ...c, lastActivity: msg.ts, unread: c.unread + inc })
     set({ chats: nc, order: sortChats(nc) })
   }
@@ -183,7 +283,11 @@ function updateMessage(msg: Message) {
 
 function applyEvent(e: ServerEvent) {
   switch (e.type) {
-    case 'message': upsertMessage(e.msg); break
+    case 'message': {
+      upsertMessage(e.msg, e.backfill)
+      if (!e.backfill && e.msg.from !== 'me') notifyMessage(e.msg)
+      break
+    }
     case 'message_update': updateMessage(e.msg); break
     case 'messages_removed': {
       const { buckets } = get()
@@ -221,6 +325,14 @@ function applyEvent(e: ServerEvent) {
       const chats = new Map(get().chats)
       chats.set(e.chat.id, e.chat)
       set({ chats, order: sortChats(chats) })
+      break
+    }
+    case 'chat_removed': {
+      const chats = new Map(get().chats)
+      chats.delete(e.chatId)
+      const buckets = new Map(get().buckets)
+      buckets.delete(e.chatId)
+      set({ chats, buckets, order: sortChats(chats), activeChat: get().activeChat === e.chatId ? null : get().activeChat })
       break
     }
     case 'typing': {
@@ -262,7 +374,16 @@ function applyEvent(e: ServerEvent) {
       }
       break
     }
-    case 'history_done': break
+    case 'history_done': {
+      // history chunks can land after connect() already resolved —
+      // re-boot merges the fresh snapshot into the running UI
+      retryBoot()
+      break
+    }
+    case 'bridge_error': {
+      toast(e.message, 'error')
+      break
+    }
   }
 }
 
@@ -287,6 +408,12 @@ export async function boot(adapter: ClientAdapter) {
     patch({ bridgeStatus: 'error' })
     return undefined
   }
+  // daemon answered before pairing finished — stay on the QR screen
+  if (snap.linked === false) {
+    booting = false
+    patch({ bridgeStatus: 'connecting' })
+    return off
+  }
   const chats = new Map(snap.chats.map((c) => [c.id, c]))
   const buckets = new Map<Id, ChatBucket>()
   for (const [chatId, msgs] of Object.entries(snap.topMessages)) {
@@ -304,7 +431,9 @@ export async function boot(adapter: ClientAdapter) {
   patch({
     phase: 'ready', account: snap.account, chats, order, buckets, contacts,
     activeChat: first, bridgeStatus: 'ready', qrString: null,
+    openUnread: first ? (chats.get(first)?.unread ?? 0) : 0,
   })
+  ensureNotifPermission()
   if (first) adapter.markRead(first)
   booting = false
   return off
@@ -327,8 +456,11 @@ export function logout() {
 }
 
 export function openChat(chatId: Id) {
-  const { adapter } = get()
-  patch({ activeChat: chatId, replyTo: null, editing: null, selection: null, showArchived: false })
+  const { adapter, chats } = get()
+  // snapshot the unread count BEFORE markRead zeroes it — the unread divider
+  // in MessageList anchors on this value
+  const openUnread = chats.get(chatId)?.unread ?? 0
+  patch({ activeChat: chatId, openUnread, replyTo: null, editing: null, selection: null, showArchived: false })
   adapter?.markRead(chatId)
 }
 
@@ -353,7 +485,8 @@ export async function loadOlder(chatId: Id) {
   if (!adapter || !b || !b.hasMore || !b.ids.length) return
   const first = b.map.get(b.ids[0])
   if (!first) return
-  const page = await adapter.loadOlder(chatId, first.ts, 60)
+  const page = await adapter.loadOlder(chatId, first.ts, 60).catch(() => null)
+  if (!page) return 0
   const nb = new Map(get().buckets)
   const map = new Map(b.map)
   const ids = page.messages.map((m) => { map.set(m.id, { ...m, v: 1 }); return m.id })
@@ -387,13 +520,28 @@ export function updateSettings(p: Partial<Settings>) {
 export async function searchInChat(chatId: Id, q: string) {
   const { adapter } = get()
   if (!adapter || !q.trim()) { patch({ searchHits: null }); return }
-  const hits = await adapter.searchMessages(chatId, q)
-  patch({ searchHits: hits })
+  try {
+    patch({ searchHits: await adapter.searchMessages(chatId, q) })
+  } catch {
+    patch({ searchHits: [] })
+  }
 }
 
-export function jumpTo(_chatId: Id, messageId: Id) {
+/** scroll to a message — loads older pages from the phone if it isn't local yet */
+export async function jumpTo(chatId: Id, messageId: Id) {
+  if (get().activeChat !== chatId) openChat(chatId)
   patch({ flashId: null })
+  const has = () => get().buckets.get(chatId)?.map.has(messageId)
+  for (let i = 0; i < 20 && !has(); i++) {
+    const n = await loadOlder(chatId)
+    if (!n) break // no older messages local — daemon may still be fetching
+  }
   requestAnimationFrame(() => patch({ flashId: messageId }))
+  // flashDone in MessageList clears it after the highlight; if the id never
+  // landed the flash is a no-op — tell the user instead of silently failing
+  setTimeout(() => {
+    if (!has() && get().flashId === messageId) toast('Message is still syncing from your phone', 'info')
+  }, 1200)
 }
 
 export function flashDone() { patch({ flashId: null }) }
@@ -421,11 +569,27 @@ export function doFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favo
 export function doMarkUnread(chatId: Id, v: boolean) {
   get().adapter?.markUnread(chatId, v)
 }
+export function doMarkRead(chatId: Id) {
+  get().adapter?.markRead(chatId)
+}
 export function doVote(chatId: Id, id: Id, idxs: number[]) {
   get().adapter?.vote(chatId, id, idxs)
 }
 export function doStar(chatId: Id, ids: Id[], v: boolean) {
   get().adapter?.star(chatId, ids, v)
+}
+export function doPinMessage(chatId: Id, id: Id, pin: boolean) {
+  get().adapter?.pinMessage?.(chatId, id, pin)
+}
+export async function doLeaveGroup(chatId: Id) {
+  const a = get().adapter
+  if (!a?.leaveGroup) return
+  try {
+    await a.leaveGroup(chatId)
+    closeChat()
+  } catch {
+    toast("Couldn't leave — try again", 'error')
+  }
 }
 export async function openContactChat(contactId: Id) {
   const { adapter, chats } = get()

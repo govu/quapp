@@ -6,9 +6,9 @@ import {
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doFlag, doForward, jumpTo, searchInChat, setPane, useStore,
+  doFlag, doForward, doLeaveGroup, jumpTo, searchInChat, setPane, toast, useStore,
 } from '../store'
-import { Avatar } from './common'
+import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
 
 function PaneShell({ children, title, onClose }: { children: React.ReactNode; title: string; onClose: () => void }) {
@@ -100,13 +100,37 @@ function Hint({ text }: { text: string }) {
 export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
   const contacts = useStore((s) => s.contacts)
   const bucket = useStore((s) => s.buckets.get(chat.id))
+  const [leaveConfirm, setLeaveConfirm] = useState(false)
   const media = useMemo(() => {
-    const out: { id: string; url: string }[] = []
+    const out: { id: string; url: string; video?: boolean }[] = []
     if (!bucket) return out
     for (const id of bucket.ids) {
       const m = bucket.map.get(id)!
       if (m.content.kind === 'image') out.push({ id: m.id, url: m.content.url })
+      else if (m.content.kind === 'video') out.push({ id: m.id, url: m.content.url, video: true })
       if (out.length >= 12) break
+    }
+    return out
+  }, [bucket])
+
+  const docs = useMemo(() => {
+    const out: Message[] = []
+    if (!bucket) return out
+    for (const id of bucket.ids) {
+      const m = bucket.map.get(id)!
+      if (m.content.kind === 'document') out.push(m)
+      if (out.length >= 8) break
+    }
+    return out
+  }, [bucket])
+
+  const links = useMemo(() => {
+    const out: { id: string; lp: NonNullable<Extract<Message['content'], { kind: 'text' }>['linkPreview']>; ts: number }[] = []
+    if (!bucket) return out
+    for (const id of bucket.ids) {
+      const m = bucket.map.get(id)!
+      if (m.content.kind === 'text' && m.content.linkPreview) out.push({ id: m.id, lp: m.content.linkPreview, ts: m.ts })
+      if (out.length >= 8) break
     }
     return out
   }, [bucket])
@@ -135,8 +159,8 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
           {contact?.about && <div className="mt-2 max-w-[260px] text-[13.5px] leading-relaxed text-[var(--label-2)]">{contact.about}</div>}
           {chat.kind !== 'saved' && chat.kind !== 'channel' && (
             <div className="mt-4 flex gap-6">
-              <RoundAction icon={<Phone size={19} />} label="Call" />
-              <RoundAction icon={<VideoCamera size={20} />} label="Video" />
+              <RoundAction icon={<Phone size={19} />} label="Call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')} />
+              <RoundAction icon={<VideoCamera size={20} />} label="Video" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')} />
               <RoundAction icon={<MagnifyingGlass size={19} />} label="Search" onClick={() => setPane('search')} />
             </div>
           )}
@@ -146,10 +170,59 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
           <Section title={`Media · ${media.length}`}>
             <div className="grid grid-cols-3 gap-[3px] px-3 pb-2">
               {media.map((m) => (
-                <button key={m.id} onClick={() => jumpTo(chat.id, m.id)} className="press aspect-square overflow-hidden rounded-[6px] bg-[var(--fill-3)]">
-                  <img src={m.url} alt="" className="size-full object-cover" loading="lazy" decoding="async" />
+                <button key={m.id} onClick={() => void jumpTo(chat.id, m.id)} className="press relative aspect-square overflow-hidden rounded-[6px] bg-[var(--fill-3)]">
+                  {m.video
+                    ? <video src={m.url} className="size-full object-cover" preload="metadata" muted />
+                    : <img src={m.url} alt="" className="size-full object-cover" loading="lazy" decoding="async" />}
+                  {m.video && <span className="absolute bottom-1 right-1 rounded bg-black/60 px-1 text-[9px] font-semibold text-white">VID</span>}
                 </button>
               ))}
+            </div>
+          </Section>
+        )}
+
+        {links.length > 0 && (
+          <Section title={`Links · ${links.length}`}>
+            <div className="px-3 pb-2">
+              {links.map((l) => (
+                <a
+                  key={l.id}
+                  href={l.lp.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="press flex w-full flex-col gap-0.5 rounded-[9px] px-2 py-2 text-left no-underline hover:bg-[var(--fill-3)]"
+                >
+                  <span className="truncate text-[13.5px] font-medium text-[var(--blue)]">{l.lp.title || l.lp.url}</span>
+                  <span className="truncate text-[12px] text-[var(--label-3)]">{l.lp.url}</span>
+                </a>
+              ))}
+            </div>
+          </Section>
+        )}
+
+        {docs.length > 0 && (
+          <Section title={`Documents · ${docs.length}`}>
+            <div className="px-3 pb-2">
+              {docs.map((m) => {
+                const d = m.content as Extract<Message['content'], { kind: 'document' }>
+                return (
+                  <a
+                    key={m.id}
+                    href={d.url ?? '#'}
+                    download={d.name}
+                    onClick={(e) => { if (!d.url) e.preventDefault() }}
+                    className="press flex w-full items-center gap-3 rounded-[9px] px-2 py-2 text-left no-underline hover:bg-[var(--fill-3)]"
+                  >
+                    <span className="grid size-8 shrink-0 place-items-center rounded-[8px] bg-[var(--blue)]/12 text-[var(--blue)]">
+                      <Archive size={15} />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-[13.5px] font-medium text-[var(--label)]">{d.name}</span>
+                      <span className="block text-[12px] text-[var(--label-3)]">{timeLabel(m.ts)}</span>
+                    </span>
+                  </a>
+                )
+              })}
             </div>
           </Section>
         )}
@@ -176,11 +249,12 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
             <div className="px-3 pb-2">
               {chat.participants.map((pid) => {
                 const c = contacts.get(pid)
+                const name = c?.name ?? (pid.includes('@') ? '+' + pid.split('@')[0] : pid)
                 return (
                   <div key={pid} className="flex items-center gap-3 rounded-[9px] px-2 py-[7px]">
-                    <Avatar name={c?.name ?? '?'} hue={c?.avatarHue ?? 0} size={36} />
+                    <Avatar name={name} hue={c?.avatarHue ?? Math.abs([...pid].reduce((a, ch) => a + ch.charCodeAt(0), 0)) % 360} url={c?.avatarUrl} size={36} />
                     <div className="min-w-0">
-                      <div className="truncate text-[14.5px]">{c?.name ?? pid}</div>
+                      <div className="truncate text-[14.5px]">{name}</div>
                       {c?.about && <div className="truncate text-[12px] text-[var(--label-3)]">{c.about}</div>}
                     </div>
                   </div>
@@ -209,8 +283,15 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
             />
             <InfoRow icon={<Archive size={17} />} label="Archive chat" onClick={() => doFlag(chat.id, 'archived', true)} />
             {chat.kind === 'group' && (
-              <InfoRow icon={<Trash size={17} />} label="Leave group" destructive onClick={() => {}} />
+              <InfoRow icon={<Trash size={17} />} label="Leave group" destructive onClick={() => setLeaveConfirm(true)} />
             )}
+            <Dialog open={leaveConfirm} onClose={() => setLeaveConfirm(false)} title={`Leave "${chat.title}"?`}
+              actions={<>
+                <DialogButton destructive onClick={() => { setLeaveConfirm(false); void doLeaveGroup(chat.id) }}>Leave</DialogButton>
+                <DialogButton onClick={() => setLeaveConfirm(false)}>Cancel</DialogButton>
+              </>}>
+              You'll be removed from the group and won't be able to send or receive its messages here.
+            </Dialog>
           </div>
         </Section>
       </div>

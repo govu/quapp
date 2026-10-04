@@ -63,8 +63,8 @@ export type MsgContent =
   | { kind: 'text'; text: string; linkPreview?: LinkPreview }
   | { kind: 'image'; url: string; w: number; h: number; caption?: string }
   | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number }
-  | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; file?: string }
-  | { kind:'document'; name: string; size: number; mime: string; pages?: number }
+  | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; url?: string; file?: string }
+  | { kind:'document'; name: string; size: number; mime: string; pages?: number; url?: string }
   | { kind: 'sticker'; emoji: string }
   | { kind: 'poll'; question: string; options: { text: string; votes: number }[]; multi: boolean; voted?: number[] }
   | { kind: 'location'; name: string; address?: string }
@@ -122,11 +122,12 @@ export type OutContent =
 
 // ---- events pushed from a backend to the store ----
 export type ServerEvent =
-  | { type: 'message'; msg: Message }
+  | { type: 'message'; msg: Message; backfill?: boolean }
   | { type: 'message_update'; msg: Message }
   | { type: 'messages_removed'; chatId: Id; ids: Id[] }
   | { type: 'delivery'; chatId: Id; ids: Id[]; delivery: Delivery }
   | { type: 'chat_update'; chat: Chat }
+  | { type: 'chat_removed'; chatId: Id }
   | { type: 'typing'; chatId: Id; names: string[] }
   | { type: 'linked'; account: Account }
   | { type: 'presence'; chatId: Id; online: boolean; lastSeen?: number }
@@ -134,9 +135,13 @@ export type ServerEvent =
   | { type: 'qr'; qr: string }
   | { type: 'connection'; state: 'open' | 'closed' }
   | { type: 'history_done' }
+  /** a command failed at the bridge — the UI surfaces it as a toast */
+  | { type: 'bridge_error'; message: string }
 
 // ---- the adapter the store drives ----
 export interface Snapshot {
+  /** false while the device isn't paired — the UI should stay on the QR screen */
+  linked?: boolean
   account: Account
   chats: Chat[]
   contacts: Contact[]
@@ -169,6 +174,13 @@ export interface ClientAdapter {
   vote(chatId: Id, messageId: Id, optionIndexes: number[]): void
   /** unlink this device — the bridge wipes its session and emits a fresh QR */
   logout(): void
+  /** optional advanced ops — demo may no-op */
+  pinMessage?(chatId: Id, messageId: Id, pin: boolean): void
+  leaveGroup?(chatId: Id): Promise<void>
+  setPrivacy?(setting: 'lastSeen' | 'profilePhoto' | 'groupsAdd' | 'readReceipts' | 'status', value: string): void
+  blocklist?(): Promise<string[]>
+  storageStats?(): Promise<{ bytes: number; files: number }>
+  clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void
   dispose(): void
 }

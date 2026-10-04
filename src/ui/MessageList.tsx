@@ -12,12 +12,14 @@ type Item =
   | { t: 'day'; key: string; label: string }
   | { t: 'unread'; key: string }
   | { t: 'more'; key: string }
+  | { t: 'start'; key: string }
 
 const GROUP_GAP = 5 * 60 * 1000
 
-function buildItems(chat: Chat, ids: Id[], map: Map<Id, Message>, hasMore: boolean, unreadIdx: number | null): Item[] {
+function buildItems(chat: Chat, ids: Id[], map: Map<Id, Message>, hasMore: boolean, unreadIdx: number | null, loaded: boolean): Item[] {
   const items: Item[] = []
-  if (hasMore) items.push({ t: 'more', key: 'more' })
+  if (hasMore || !loaded) items.push({ t: 'more', key: 'more' })
+  else items.push({ t: 'start', key: 'start' }) // full history on this device
   let prev: Message | null = null
   const isFirst: boolean[] = []
   const isLast: boolean[] = []
@@ -50,21 +52,26 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   const ids = useStore((s) => s.buckets.get(chat.id)?.ids ?? EMPTY)
   const map = useStore((s) => s.buckets.get(chat.id)?.map)
   const hasMore = useStore((s) => s.buckets.get(chat.id)?.hasMore ?? false)
+  const loaded = useStore((s) => s.buckets.get(chat.id)?.loaded ?? false)
   const flashId = useStore((s) => s.flashId)
   const scrollRef = useRef<HTMLDivElement>(null)
   const atBottom = useRef(true)
   const loadingOlder = useRef(false)
+  const mountTs = useRef(Date.now()) // backfill older than mount never counts as "new"
   const prevFirstId = useRef<Id | undefined>(undefined)
   const prevLastId = useRef<Id | undefined>(undefined)
   const prevCount = useRef(0)
   const [away, setAway] = useState(false)
   const [pending, setPending] = useState(0)
 
-  const unreadIdx = initialUnread > 0 && initialUnread < ids.length ? ids.length - initialUnread : null
+  // the unread divider anchors on the count captured when the chat was
+  // opened — markRead zeroes chat.unread but the divider must stay put
+  const [anchorUnread] = useState(initialUnread)
+  const unreadIdx = anchorUnread > 0 && anchorUnread < ids.length ? ids.length - anchorUnread : null
 
   const items = useMemo(
-    () => (map ? buildItems(chat, ids, map, hasMore, unreadIdx) : []),
-    [chat, ids, map, hasMore, unreadIdx],
+    () => (map ? buildItems(chat, ids, map, hasMore, unreadIdx, loaded) : []),
+    [chat, ids, map, hasMore, unreadIdx, loaded],
   )
 
   const virt = useVirtualizer({
@@ -72,7 +79,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
     getScrollElement: () => scrollRef.current,
     estimateSize: (i) => {
       const it = items[i]
-      return it.t === 'day' || it.t === 'unread' ? 44 : it.t === 'more' ? 48 : 42
+      return it.t === 'day' || it.t === 'unread' ? 44 : it.t === 'more' || it.t === 'start' ? 48 : 42
     },
     overscan: 14,
     getItemKey: (i) => (items[i].t === 'msg' ? items[i].id : items[i].key),
@@ -97,16 +104,19 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   useEffect(() => {
     const last = ids[ids.length - 1]
     if (prevLastId.current !== last) {
-      const grew = ids.length > prevCount.current
+      const lastMsg = map?.get(last)
+      // only genuinely-new messages (arriving after this list mounted) bump the pill —
+      // history merges and on-demand fetches grow the list but aren't "new"
+      const isNew = !!lastMsg && lastMsg.ts > mountTs.current - 1000
       if (atBottom.current && items.length) {
         requestAnimationFrame(() => virt.scrollToIndex(items.length - 1, { align: 'end' }))
-      } else if (grew) {
-        setPending((p) => p + (ids.length - prevCount.current))
+      } else if (isNew && prevLastId.current) {
+        setPending((p) => p + 1)
       }
       prevLastId.current = last
     }
     prevCount.current = ids.length
-  }, [ids, items.length, virt])
+  }, [ids, items.length, virt, map])
 
   // when the first id changes (older page prepended), keep the previous first row anchored
   useEffect(() => {
@@ -173,6 +183,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
                 </div>
               )}
               {it.t === 'more' && <LoadingRow done={false} />}
+              {it.t === 'start' && <LoadingRow done />}
               {it.t === 'unread' && (
                 <div className="my-2 grid place-items-center">
                   <span className="pill rounded-full px-3 py-[5px] text-[12px] font-medium text-[var(--blue)]">Unread messages</span>

@@ -8,7 +8,7 @@ import {
 import type { Chat, Id } from '../bridge/types'
 import { cx, highlight, listTime } from '../lib/util'
 import {
-  doFlag, doMarkUnread, openChat, setFilter, setPalette, setQuery, setRelinkPrompt,
+  doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setQuery, setRelinkPrompt,
   setSettingsOpen, setShowArchived, useStore, type Filter,
 } from '../store'
 import { Avatar } from './common'
@@ -70,6 +70,7 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
       { label: chat.markedUnread ? 'Mark as read' : 'Mark as unread', icon: <Checks size={16} />, onClick: () => doMarkUnread(id, !chat.markedUnread) },
       { label: chat.favorite ? 'Remove from favorites' : 'Add to favorites', icon: <Star size={16} />, onClick: () => doFlag(id, 'favorite', !chat.favorite), disabled: chat.kind === 'channel' },
       { label: chat.archived ? 'Unarchive' : 'Archive', icon: <Archive size={16} />, onClick: () => doFlag(id, 'archived', !chat.archived), separatorAbove: true },
+      { label: 'Mark as read', icon: <Checks size={16} />, onClick: () => doMarkRead(id), hidden: !(chat.unread > 0 || chat.markedUnread) },
     ])
   }
   return (
@@ -108,15 +109,19 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
               <><span className="text-[var(--red)]">Draft: </span>{draft}</>
             ) : query ? <Hl text={pv.text} q={query} /> : pv.text}
           </span>
-          {chat.pinned && <PushPin size={12} weight="fill" className="ml-auto shrink-0 rotate-45 text-[var(--label-3)]" />}
-          {chat.muted && <BellSlash size={13} weight="fill" className="ml-auto shrink-0 text-[var(--label-3)]" />}
-          {chat.markedUnread && <span className="ml-auto size-[10px] shrink-0 rounded-full bg-[var(--blue)]" />}
-          {chat.unread > 0 && !chat.markedUnread && (
-            <span className={cx(
-              'ml-auto grid h-[19px] min-w-[19px] shrink-0 place-items-center rounded-full px-[5px] text-[11px] font-semibold tabular-nums',
-              chat.muted ? 'bg-[var(--fill)] text-[var(--label-2)]' : 'bg-[var(--blue)] text-white',
-            )}>
-              {chat.unread > 99 ? '99+' : chat.unread}
+          {(chat.pinned || chat.muted || chat.markedUnread || chat.unread > 0) && (
+            <span className="ml-auto flex shrink-0 items-center gap-1">
+              {chat.muted && <BellSlash size={13} weight="fill" className="text-[var(--label-3)]" />}
+              {chat.pinned && <PushPin size={12} weight="fill" className="rotate-45 text-[var(--label-3)]" />}
+              {chat.markedUnread && <span className="size-[10px] rounded-full bg-[var(--blue)]" />}
+              {chat.unread > 0 && !chat.markedUnread && (
+                <span className={cx(
+                  'grid h-[19px] min-w-[19px] place-items-center rounded-full px-[5px] text-[11px] font-semibold tabular-nums',
+                  chat.muted ? 'bg-[var(--fill)] text-[var(--label-2)]' : 'bg-[var(--blue)] text-white',
+                )}>
+                  {chat.unread > 99 ? '99+' : chat.unread}
+                </span>
+              )}
             </span>
           )}
         </div>

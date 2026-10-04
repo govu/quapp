@@ -14,13 +14,21 @@ import { ForwardSheet } from './ui/Panes'
 
 const SettingsSheet = lazy(() => import('./ui/Settings').then((m) => ({ default: m.SettingsSheet })))
 
+// the daemon accepts only connections carrying its per-launch token; the
+// Electron main process reads token.txt and passes it in via ?token=
+function withToken(url: string, q: URLSearchParams): string {
+  const token = q.get('token')
+  if (!token) return url
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token)
+}
+
 function makeAdapter(): ClientAdapter {
   const q = new URLSearchParams(location.search)
   const url = q.get('bridge')
-  if (url) return new WsAdapter(url)
+  if (url) return new WsAdapter(withToken(url, q))
   if (q.has('demo')) return new DemoAdapter()
   // inside the packaged app the quappd daemon runs as a child process
-  if (navigator.userAgent.includes('Electron')) return new WsAdapter('ws://127.0.0.1:8765')
+  if (navigator.userAgent.includes('Electron')) return new WsAdapter(withToken('ws://127.0.0.1:8765', q))
   return new DemoAdapter()
 }
 

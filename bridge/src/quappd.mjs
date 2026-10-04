@@ -22,11 +22,13 @@ import makeWASocket, {
   isJidBroadcast,
   isJidNewsletter,
   getAggregateVotesInPollMessage,
+  proto,
 } from '@whiskeysockets/baileys'
 import { WebSocketServer } from 'ws'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 
 const HOST = process.env.QUAPP_HOST ?? '127.0.0.1'
 const WS_PORT = Number(process.env.QUAPP_WS_PORT ?? 8765)
@@ -36,6 +38,21 @@ const AUTH_DIR = path.join(DATA, 'auth')
 const MEDIA_DIR = path.join(DATA, 'media')
 const MEDIA_BASE = `http://${HOST}:${MEDIA_PORT}/m`
 for (const d of [AUTH_DIR, MEDIA_DIR]) fs.mkdirSync(d, { recursive: true })
+
+// per-launch command token — any local webpage could otherwise drive the WS
+// (browsers don't preflight WebSocket). Quapp reads it from this file via the
+// Electron main process and attaches it as ?token= on the ws URL.
+// QUAPPD_DEV=1 skips the check for standalone development.
+const DEV = process.env.QUAPPD_DEV === '1'
+// persistent per data dir (not per launch) so a daemon restart doesn't strand
+// an already-loaded renderer with a stale token
+const TOKEN_FILE = path.join(DATA, 'token.txt')
+let TOKEN = ''
+try { TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim() } catch { /* first boot */ }
+if (!TOKEN) {
+  TOKEN = crypto.randomBytes(24).toString('base64url')
+  try { fs.writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600 }) } catch { /* ok */ }
+}
 
 const log = (...a) => console.log('[quappd]', ...a)
 const logger = {
@@ -60,10 +77,13 @@ const S = {
   lastKey: new Map(), // chatId -> raw key of newest incoming msg (read receipts)
   flags: { favorite: new Set(), unread: new Set(), starred: new Set() },
   typingTimers: new Map(), // chatId -> Map<jid, timeout>
+  lidToPn: new Map(), // '@lid' -> '@s.whatsapp.net' (privacy-hidden ids)
+  pushNames: new Map(), // jid -> last seen pushName
   clients: new Set(),
   readyWaiters: [],
   avatarQueued: new Set(),
   metaQueued: new Set(),
+  subscribedPresence: new Set(),
   connecting: false,
   lastQr: null,
   backoff: 2000,
@@ -84,16 +104,77 @@ const saveFlags = () => {
   }, 400)
 }
 
+// ---------- durable state ----------
+// WhatsApp replays full history exactly once, at link time (ZapFast's
+// archive.db exists for the same reason) — so chats, contacts and messages
+// are persisted here and survive daemon restarts.
+const STATE_FILE = path.join(DATA, 'state.v1.json')
+const MSGS_PERSIST_CAP = 400 // per chat — deep scrolls stay on-demand anyway
+let stateDirty = false
+let stateTimer = null
+const markDirty = () => {
+  stateDirty = true
+  if (stateTimer) return
+  stateTimer = setTimeout(writeState, 4000)
+}
+function writeState() {
+  stateTimer = null
+  if (!stateDirty) return
+  stateDirty = false
+  try {
+    const msgs = {}
+    for (const [cid, bucket] of S.msgs) {
+      const arr = [...bucket.values()].slice(-MSGS_PERSIST_CAP)
+      msgs[cid] = arr.map((e) => ({
+        m: e.model,
+        p: Buffer.from(proto.WebMessageInfo.encode(e.proto).finish()).toString('base64'),
+      }))
+    }
+    const st = {
+      chats: [...S.chats.values()],
+      contacts: [...S.contacts.values()],
+      lidToPn: [...S.lidToPn],
+      pushNames: [...S.pushNames],
+      me: S.me,
+      msgs,
+    }
+    const tmp = STATE_FILE + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(st))
+    fs.renameSync(tmp, STATE_FILE)
+  } catch (e) { log('state write failed:', e?.message) }
+}
+try {
+  const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+  for (const c of st.chats ?? []) S.chats.set(c.id, c)
+  for (const c of st.contacts ?? []) S.contacts.set(c.id, c)
+  for (const [k, v] of st.lidToPn ?? []) S.lidToPn.set(k, v)
+  for (const [k, v] of st.pushNames ?? []) S.pushNames.set(k, v)
+  S.me = st.me ?? null
+  for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
+    const bucket = new Map()
+    for (const { m, p } of arr) {
+      try { bucket.set(m.id, { proto: proto.WebMessageInfo.decode(Buffer.from(p, 'base64')), model: m }) } catch { /* bad blob */ }
+    }
+    if (bucket.size) S.msgs.set(cid, bucket)
+  }
+  log(`state restored: ${S.chats.size} chats, ${S.contacts.size} contacts, ${S.msgs.size} msg buckets`)
+} catch { /* first run */ }
+
 const emit = (ev) => {
   const raw = JSON.stringify({ ev })
   for (const ws of S.clients) if (ws.readyState === 1) ws.send(raw)
 }
-const respond = (ws, id, ok, resultOrErr) =>
-  ws.send(JSON.stringify(ok ? { id, ok: true, result: resultOrErr } : { id, ok: false, error: String(resultOrErr?.message ?? resultOrErr) }))
+const respond = (ws, id, ok, resultOrErr) => {
+  try {
+    if (ws.readyState === 1)
+      ws.send(JSON.stringify(ok ? { id, ok: true, result: resultOrErr } : { id, ok: false, error: String(resultOrErr?.message ?? resultOrErr) }))
+  } catch { /* socket raced a close */ }
+}
 
 // ---------- helpers ----------
 const norm = (jid) => jidNormalizedUser(jid ?? '')
-const ownJid = () => (S.me ? S.me.id : '')
+// strip the :device suffix — all chat/participant jids are device-less
+const ownJid = () => (S.me ? S.me.id.split(':')[0] + '@' + S.me.id.split('@')[1] : '')
 const msgsOf = (chatId) => S.msgs.get(chatId) ?? new Map()
 const sortedMsgs = (chatId) => [...msgsOf(chatId).values()].map((e) => e.model).sort((a, b) => a.ts - b.ts)
 const enc = encodeURIComponent
@@ -104,18 +185,32 @@ const contactName = (jid) => {
   const c = S.contacts.get(norm(jid))
   return c?.name ?? c?.firstName ?? undefined
 }
+// LIDs are privacy aliases — resolve to the real phone jid when we know it
+const resolveJid = (jid) => jid.endsWith('@lid') ? (S.lidToPn.get(jid) ?? jid) : jid
 const displayName = (jid) => {
   jid = norm(jid)
   if (jid === ownJid()) return 'You'
-  const c = S.contacts.get(jid)
+  const real = resolveJid(jid)
+  const c = S.contacts.get(real) ?? S.contacts.get(jid)
   if (c?.name || c?.firstName) return c.name ?? c.firstName
-  if (jid.endsWith('@lid')) return 'WhatsApp user'
-  return '+' + jid.split('@')[0]
+  const pn = S.pushNames.get(real) ?? S.pushNames.get(jid)
+  if (pn) return pn
+  if (real.endsWith('@lid')) return 'WhatsApp user' // still no mapping
+  if (isJidGroup(real)) return 'Group'
+  if (isJidNewsletter(real)) return 'Channel'
+  return '+' + real.split('@')[0]
 }
 
 function upsertContact(raw) {
   const jid = norm(raw.id ?? raw.jid ?? raw.lid)
   if (!jid || jid.includes('@broadcast') || isJidNewsletter(jid)) return
+  // Baileys gives { id, lid } pairs — index under both so @lid chats resolve
+  const lid = raw.lid ? norm(raw.lid) : null
+  if (lid && lid !== jid) {
+    S.lidToPn.set(lid, jid)
+    const lc = S.contacts.get(lid) ?? {}
+    S.contacts.set(lid, { ...lc, id: lid, linkedJid: jid })
+  }
   const prev = S.contacts.get(jid)
   const c = {
     id: jid,
@@ -124,10 +219,29 @@ function upsertContact(raw) {
     about: raw.status ?? prev?.about,
     phone: jid.endsWith('@s.whatsapp.net') ? '+' + jid.split('@')[0] : undefined,
     avatarHue: hue(jid),
-    avatarUrl: prev?.avatarUrl,
+    avatarUrl: prev?.avatarUrl ?? `http://${HOST}:${MEDIA_PORT}/a/${encodeURIComponent(jid)}?token=${TOKEN}`,
     verified: !!raw.verifiedName,
   }
   S.contacts.set(jid, c)
+  markDirty()
+  // a contact arriving late may resolve a chat titled '+digits'/'WhatsApp user'
+  retitleChats()
+}
+function retitleChats() {
+  for (const ch of S.chats.values()) {
+    if (ch.kind !== 'dm') continue
+    if (!ch.title.startsWith('+') && ch.title !== 'WhatsApp user') continue
+    const better = displayName(ch.id)
+    if (better !== ch.title && better !== 'WhatsApp user' && !better.startsWith('+')) {
+      ch.title = better
+      emit({ type: 'chat_update', chat: ch })
+      markDirty()
+    } else if (better.startsWith('+') && ch.title === 'WhatsApp user') {
+      ch.title = better // resolved lid → real number beats a generic label
+      emit({ type: 'chat_update', chat: ch })
+      markDirty()
+    }
+  }
 }
 
 function chatKind(jid) {
@@ -150,7 +264,7 @@ function upsertChat(raw) {
     avatarUrl: prev?.avatarUrl,
     participants: prev?.participants ?? [],
     pinned: !!raw.pinned || prev?.pinned || false,
-    muted: Number(raw.muteEndTime ?? 0) > Date.now() || prev?.muted || false,
+    muted: muteEnds(raw.muteEndTime) || prev?.muted || false,
     archived: !!raw.archived || prev?.archived || false,
     favorite: S.flags.favorite.has(jid),
     unread: raw.unreadCount ?? prev?.unread ?? 0,
@@ -159,16 +273,21 @@ function upsertChat(raw) {
       ? Number(raw.conversationTimestamp) * 1000
       : (prev?.lastActivity ?? lastMsgTs(jid)),
     draft: prev?.draft,
-    pinnedMessageId: raw.pinned ?? undefined,
+    pinnedMessageId: prev?.pinnedMessageId,
     ephemeral: !!raw.ephemeralExpiration,
     youAdmin: prev?.youAdmin,
     contactId: kind === 'dm' ? jid : undefined,
   }
+  if (!chat.avatarUrl && (kind === 'dm' || kind === 'group' || kind === 'channel'))
+    chat.avatarUrl = `http://${HOST}:${MEDIA_PORT}/a/${encodeURIComponent(jid)}?token=${TOKEN}` // lazy proxy — resolves fresh, never expires client-side
   S.chats.set(jid, chat)
-  queueAvatar(jid)
+  markDirty()
   if (kind === 'group' && !chat.participants.length) queueGroupMeta(jid)
+  if (kind === 'channel' && !raw.name) queueNewsMeta(jid)
   return chat
 }
+// -1 = muted forever; a future timestamp = until then
+const muteEnds = (m) => { const n = Number(m ?? 0); return n < 0 || n > Date.now() }
 const lastMsgTs = (chatId) => {
   const arr = msgsOf(chatId)
   let t = 0
@@ -177,8 +296,8 @@ const lastMsgTs = (chatId) => {
 }
 
 // ---------- message conversion ----------
-const STATUS = { 0: 'pending', 1: 'pending', 2: 'sent', 3: 'delivered', 4: 'read', 5: 'read' }
-const mediaUrl = (chatId, id) => `${MEDIA_BASE}/${enc(chatId)}/${enc(id)}`
+const STATUS = { 0: 'failed', 1: 'pending', 2: 'sent', 3: 'delivered', 4: 'read', 5: 'read' }
+const mediaUrl = (chatId, id) => `${MEDIA_BASE}/${enc(chatId)}/${enc(id)}?token=${TOKEN}`
 
 function previewOf(raw) {
   const inner = extractMessageContent(raw?.message)
@@ -216,7 +335,7 @@ function convertContent(chatId, id, inner) {
     case 'documentMessage':
     case 'documentWithCaptionMessage': {
       const d = type === 'documentWithCaptionMessage' ? c.message?.documentMessage ?? {} : c
-      return { kind: 'document', name: d.fileName ?? 'Document', size: Number(d.fileLength ?? 0), mime: d.mimetype ?? 'application/octet-stream', pages: d.pageCount }
+      return { kind: 'document', name: d.fileName ?? 'Document', size: Number(d.fileLength ?? 0), mime: d.mimetype ?? 'application/octet-stream', pages: d.pageCount, url: mediaUrl(chatId, id) }
     }
     case 'stickerMessage':
       return { kind: 'sticker', emoji: c.firstEmoji || '🎭' }
@@ -271,7 +390,7 @@ function toModel(raw) {
     const quotedRaw = { key: { remoteJid: chatId, id: ctx.stanzaId, participant: ctx.participant, fromMe: ctx.participant === ownJid() }, message: ctx.quotedMessage }
     model.replyTo = {
       id: ctx.stanzaId,
-      from: quotedRaw.key.fromMe ? 'me' : norm(ctx.participant ?? chatId),
+      from: norm(ctx.participant ?? '') === ownJid() ? 'me' : norm(ctx.participant ?? chatId),
       fromName: displayName(ctx.participant ?? chatId),
       preview: previewOf(quotedRaw),
       kind: 'text',
@@ -321,8 +440,24 @@ function storeRaw(raw, model) {
     bucket.delete(oldest)
   }
   bucket.set(model.id, { proto: raw, model })
+  markDirty()
   const chat = S.chats.get(model.chatId)
   if (chat) chat.lastActivity = Math.max(chat.lastActivity, model.ts)
+  // learn pushNames from messages — the only name source for @lid contacts
+  const sender = norm(raw.key?.participant ?? raw.key?.remoteJid ?? '')
+  if (raw.pushName && sender && sender !== ownJid()) {
+    S.pushNames.set(sender, raw.pushName)
+    // a DM titled '+'+digits or 'WhatsApp user' upgrades to the real name
+    const dc = S.chats.get(sender)
+    if (dc && (dc.title.startsWith('+') || dc.title === 'WhatsApp user')) {
+      dc.title = raw.pushName
+      emit({ type: 'chat_update', chat: dc })
+    }
+    const ct = S.contacts.get(sender)
+    if (ct && !ct.name) ct.name = raw.pushName
+  }
+  // receipts need a key even for messages that only arrived via history
+  if (!raw.key?.fromMe && raw.key) S.lastKey.set(model.chatId, raw.key)
 }
 
 // ---------- socket ----------
@@ -348,25 +483,69 @@ async function ensureSocket() {
       shouldIgnoreJid: (jid) => isJidBroadcast(jid),
     })
     S.sock = sock
-    const safe = (fn) => (...a) => { try { fn(...a) } catch (e) { log('event handler failed:', e?.message) } }
-    sock.ev.on('creds.update', S.authState.saveCreds)
+    // ignore events from a socket that was replaced (logout / overlapping
+    // reconnects) — they would null out live state and write stale creds
+    const safe = (fn) => (...a) => {
+      if (sock !== S.sock) return
+      try { fn(...a) } catch (e) { log('event handler failed:', e?.message) }
+    }
+    sock.ev.on('creds.update', (...a) => S.authState?.saveCreds?.(...a))
     sock.ev.on('connection.update', safe(onConn))
     sock.ev.on('messaging-history.set', safe(onHistory))
-    sock.ev.on('chats.upsert', safe((chats) => { for (const c of chats) { const m = upsertChat(c); if (m && S.historyDone) emit({ type: 'chat_update', chat: m }) } }))
+    sock.ev.on('chats.upsert', safe((chats) => { for (const c of chats) { const m = upsertChat(c); if (m) emit({ type: 'chat_update', chat: m }) } }))
     sock.ev.on('chats.update', safe(onChatsUpdate))
+    sock.ev.on('chats.delete', safe((jids) => {
+      for (const j of jids) {
+        const chatId = norm(j)
+        S.chats.delete(chatId); S.msgs.delete(chatId)
+        emit({ type: 'chat_removed', chatId })
+      }
+    }))
     sock.ev.on('contacts.upsert', safe((cs) => { for (const c of cs) upsertContact(c) }))
     sock.ev.on('contacts.update', safe((cs) => { for (const c of cs) upsertContact(c) }))
     sock.ev.on('messages.upsert', safe(onMessages))
     sock.ev.on('messages.update', safe(onMessagesUpdate))
     sock.ev.on('messages.delete', safe(onMessagesDelete))
     sock.ev.on('presence.update', safe(onPresence))
+    sock.ev.on('groups.update', safe((mds) => { for (const md of mds ?? []) applyGroupMeta(md) }))
+    sock.ev.on('groups.upsert', safe((mds) => { for (const md of mds ?? []) applyGroupMeta(md) }))
+    sock.ev.on('group-participants.update', safe(({ id, participants, action }) => {
+      const jid = norm(id); const chat = S.chats.get(jid)
+      if (!chat) return
+      const who = new Set((participants ?? []).map(norm))
+      if (action === 'remove') chat.participants = chat.participants.filter((p) => !who.has(p))
+      else if (action === 'add') chat.participants = [...new Set([...chat.participants, ...who])]
+      else { S.metaQueued.delete(jid); queueGroupMeta(jid); return } // promote/demote/etc → refetch
+      emit({ type: 'chat_update', chat })
+    }))
     log('socket started, protocol', version.join('.'))
   } catch (e) {
     S.sock = null
     log('socket start failed:', e?.message)
+    setTimeout(ensureSocket, 10000) // offline? keep retrying instead of idling
   } finally {
     S.connecting = false
   }
+}
+
+function applyGroupMeta(md) {
+  const jid = norm(md.id)
+  const chat = S.chats.get(jid) ?? upsertChat({ id: jid })
+  if (!chat) return
+  if (md.subject) chat.title = md.subject
+  if (md.participants?.length) {
+    chat.participants = md.participants.map((p) => norm(p.id ?? p.jid))
+    chat.youAdmin = md.participants.some((p) => norm(p.id ?? p.jid) === ownJid() && !!p.admin)
+  }
+  if (md.ephemeralDuration) chat.ephemeral = true
+  emit({ type: 'chat_update', chat })
+  for (const p of md.participants ?? []) {
+    // participants carry both identities — {id: as-sent, jid: pn, lid: @lid}
+    if (p.lid && p.jid) S.lidToPn.set(norm(p.lid), norm(p.jid))
+    upsertContact({ id: p.jid ?? p.id })
+  }
+  // once the LID map grows, unresolved chat titles may now resolve — emit updates
+  retitleChats()
 }
 
 function onConn({ connection, lastDisconnect, qr }) {
@@ -376,7 +555,8 @@ function onConn({ connection, lastDisconnect, qr }) {
     S.backoff = 2000
     S.lastQr = null
     const u = S.sock.user
-    S.me = { id: norm(u.id), name: u.name ?? 'Me', phone: '+' + norm(u.id).split('@')[0] }
+    const devId = norm(u.id)
+    S.me = { id: devId.split(':')[0] + '@' + devId.split('@')[1], name: u.name ?? 'Me', phone: '+' + devId.split(':')[0] }
     emit({ type: 'linked', account: snapshot().account })
     log('linked as', S.me.name)
     // resolve early if history already arrived or shortly after
@@ -384,17 +564,52 @@ function onConn({ connection, lastDisconnect, qr }) {
     // if the link raced a 515 restart, history may never arrive — at least
     // pull groups so the chat list isn't empty, and emit what we have
     setTimeout(() => {
-      if (!S.open || S.chats.size > 0) return
-      log('no history received — falling back to group fetch')
-      S.sock?.groupFetchAllParticipating?.()
-        .then((groups) => {
-          for (const g of Object.values(groups ?? {})) {
-            const m = upsertChat({ id: g.id, name: g.subject })
-            if (m) emit({ type: 'chat_update', chat: m })
-          }
-          log(`group fallback: ${S.chats.size} chats`)
-        })
-        .catch((e) => log('group fetch failed:', e?.message))
+      if (!S.open) return
+      if (!S.historyDone && S.chats.size < 30) {
+        // the phone never pushed the chat list — force a FULL app-state
+        // resync by clearing the stored collection versions (return_snapshot
+        // is only sent when a collection has no saved version). Replays every
+        // chat/contact/mute/archive mutation through chats.update+contacts.upsert.
+        log('no history received — full app-state resync')
+        void (async () => {
+          try {
+            await S.authState?.state?.keys?.set?.({
+              'app-state-sync-version': { regular_high: null, regular_low: null, regular: null, critical_unblock_low: null, critical_block: null },
+            })
+            await S.sock?.resyncAppState?.(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)
+            S.sock?.ev?.flush?.()
+          } catch (e) { log('appstate resync failed:', e?.message) }
+        })()
+      }
+      if (S.chats.size === 0) {
+        S.sock?.groupFetchAllParticipating?.()
+          .then((groups) => {
+            for (const g of Object.values(groups ?? {})) {
+              const m = upsertChat({ id: g.id, name: g.subject })
+              if (m) emit({ type: 'chat_update', chat: m })
+            }
+            log(`group fallback: ${S.chats.size} chats`)
+          })
+          .catch((e) => log('group fetch failed:', e?.message))
+      }
+      // discovery: probe synced contacts for on-demand history to rebuild
+      // the DM list when the initial history push never arrived
+      setTimeout(() => {
+        if (!S.open) return
+        const known = new Set(S.chats.keys())
+        const candidates = [...S.contacts.keys()]
+          .filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j))
+          .slice(0, 150)
+        log(`contact discovery: ${candidates.length} candidates`)
+        if (!candidates.length) return
+        let i = 0
+        const tick = () => {
+          if (!S.open || i >= candidates.length) return
+          void requestHistory(candidates[i++], 25)
+          setTimeout(tick, 1600)
+        }
+        tick()
+      }, 25000)
     }, 15000)
   }
   if (connection === 'close') {
@@ -405,7 +620,12 @@ function onConn({ connection, lastDisconnect, qr }) {
       log('logged out — clearing session')
       S.me = null
       S.historyDone = false
-      fs.rm(AUTH_DIR, { recursive: true, force: true }, () => fs.mkdirSync(AUTH_DIR, { recursive: true }))
+      readyEmitted = false
+      S.authState = null // in-memory creds are dead too — never reuse them
+      S.chats.clear(); S.msgs.clear(); S.contacts.clear()
+      S.lidToPn.clear(); S.pushNames.clear()
+      stateDirty = false
+      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.rmSync(STATE_FILE, { force: true }); fs.rmSync(MEDIA_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch { /* retried on next boot */ }
     } else {
       log(`connection closed (${code ?? '?'}) ${detail} — reconnecting`)
     }
@@ -430,28 +650,42 @@ function onHistory({ chats, contacts, messages, syncType, isLatest }) {
   const arr = Array.isArray(messages) ? messages : Object.values(messages ?? {})
   let n = 0
   for (const raw of arr) {
+    // history replays reactions / poll votes / protocol msgs too — apply them
+    // to their targets instead of rendering "Unsupported message" rows
+    const jid = norm(raw.key?.remoteJidAlt ?? raw.key?.remoteJid)
+    const inner = extractMessageContent(raw.message)
+    const t = inner && getContentType(inner)
+    if (t === 'reactionMessage') { applyReaction(raw, inner.reactionMessage); continue }
+    if (t === 'pollUpdateMessage') { void applyPollUpdate(raw, inner.pollUpdateMessage); continue }
+    if (t === 'protocolMessage') {
+      const p = inner.protocolMessage
+      if (p?.type === 14 && p.editedMessage) applyEdit(raw, p)
+      else if (p?.type === 0) applyRevoke(jid, p.key?.id)
+      continue
+    }
+    if (t === 'senderKeyDistributionMessage' || t === 'keepInChatMessage') continue
     const model = toModel(raw)
     if (model) { storeRaw(raw, model); n++ }
   }
   if (isLatest || syncType === 0 || syncType === 7) S.historyDone = true // FULL_BOOTSTRAP / latest / NO_HISTORY
   log(`history sync type=${syncType} latest=${!!isLatest}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
   maybeReady()
-  if (S.historyDone) {
-    emit({ type: 'history_done' })
-    kickMetaQueue()
-  }
+  // every chunk (incl. ON_DEMAND fetches) is a reason for the UI to resync
+  emit({ type: 'history_done' })
+  kickMetaQueue()
 }
 
 function onChatsUpdate(updates) {
   for (const u of updates) {
     const jid = norm(u.id)
     const chat = S.chats.get(jid)
-    if (!chat) { upsertChat(u); continue }
+    if (!chat) { const m = upsertChat(u); if (m) emit({ type: 'chat_update', chat: m }); continue }
     if (u.name) chat.title = u.name
     if (u.unreadCount != null) chat.unread = u.unreadCount
     if (u.pinned != null) chat.pinned = !!u.pinned
     if (u.archived != null) chat.archived = !!u.archived
-    if (u.muteEndTime != null) chat.muted = Number(u.muteEndTime) > Date.now()
+    if (u.muteEndTime != null) chat.muted = muteEnds(u.muteEndTime)
+    if (u.conversationTimestamp != null) chat.lastActivity = Math.max(chat.lastActivity, Number(u.conversationTimestamp) * 1000)
     if (u.markedAsUnread != null) {
       chat.markedUnread = !!u.markedAsUnread
       u.markedAsUnread ? S.flags.unread.add(jid) : S.flags.unread.delete(jid)
@@ -463,35 +697,38 @@ function onChatsUpdate(updates) {
 
 function onMessages({ messages, type }) {
   for (const raw of messages) {
-    const jid = norm(raw.key?.remoteJid)
+    const jid = norm(raw.key?.remoteJidAlt ?? raw.key?.remoteJid)
     if (!jid || isJidBroadcast(jid)) continue
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
 
     if (t === 'reactionMessage') { applyReaction(raw, inner.reactionMessage); continue }
-    if (t === 'pollUpdateMessage') { applyPollUpdate(raw, inner.pollUpdateMessage); continue }
+    if (t === 'pollUpdateMessage') { void applyPollUpdate(raw, inner.pollUpdateMessage); continue }
     if (t === 'protocolMessage') {
       const p = inner.protocolMessage
       if (p?.type === 14 && p.editedMessage) applyEdit(raw, p) // MESSAGE_EDIT
       else if (p?.type === 0) applyRevoke(jid, p.key?.id) // REVOKE
       continue
     }
+    if (t === 'senderKeyDistributionMessage' || t === 'keepInChatMessage') continue
     if (raw.message?.protocolMessage?.type === 0) { applyRevoke(jid, raw.message.protocolMessage.key?.id); continue }
 
     const model = toModel(raw)
     if (!model) continue
-    if (!S.chats.has(jid)) upsertChat({ id: jid })
+    const isNewChat = !S.chats.has(jid)
+    if (isNewChat) upsertChat({ id: jid })
     storeRaw(raw, model)
-    if (!raw.key.fromMe) S.lastKey.set(jid, raw.key)
 
+    const chat = S.chats.get(jid)
     if (type === 'notify') {
-      const chat = S.chats.get(jid)
       if (chat) { chat.unread = model.from === 'me' ? chat.unread : chat.unread + 1; chat.lastActivity = model.ts }
       emit({ type: 'message', msg: model })
       if (chat) emit({ type: 'chat_update', chat })
-    } else if (type === 'append' && S.historyDone) {
-      // backfill while online — only surface after the initial sync
-      emit({ type: 'message', msg: model })
+    } else {
+      // 'append' = offline backfill, not a live ping — the UI inserts it into
+      // the bucket but must not bump unread or the "new messages" pill
+      if (chat && (chat.lastActivity < model.ts || isNewChat)) { chat.lastActivity = Math.max(chat.lastActivity, model.ts); emit({ type: 'chat_update', chat }) }
+      emit({ type: 'message', msg: model, backfill: true })
     }
   }
 }
@@ -501,7 +738,7 @@ function applyReaction(raw, r) {
   const targetId = r.key?.id
   const entry = msgsOf(chatId).get(targetId)
   if (!entry) return
-  const reactor = raw.key.fromMe ? 'me' : norm(raw.key.participant ?? r.key.participant ?? chatId)
+  const reactor = raw.key.fromMe ? 'me' : norm(raw.key.participant ?? raw.key.remoteJid)
   const list = (entry.model.reactions ?? []).filter((x) => x.by !== reactor)
   if (r.text) list.push({ emoji: r.text, by: reactor })
   entry.model.reactions = list.length ? list : undefined
@@ -513,16 +750,15 @@ async function applyPollUpdate(raw, p) {
   const entry = msgsOf(chatId).get(p.pollCreationMessageKey?.id)
   if (!entry || entry.model.content.kind !== 'poll') return
   try {
-    const votes = await getAggregateVotesInPollMessage({ message: entry.proto, pollUpdates: [raw] }, ownJid())
-    const counts = new Map()
-    for (const v of votes ?? []) for (const opt of v.voters ?? []) counts.set(opt, (counts.get(opt) ?? 0) + 1)
-    // votes arrive as [optionHash?] — baileys returns selected option indices in `voters`? fall back to name match
-    const opts = entry.model.content.options
+    // aggregate over ALL update messages seen so far — each update replaces a
+    // voter's prior selection, never adds to it
+    entry.pollUpdates ??= []
+    entry.pollUpdates.push(raw)
+    const votes = await getAggregateVotesInPollMessage({ message: entry.proto, pollUpdates: entry.pollUpdates }, ownJid())
+    for (const o of entry.model.content.options) o.votes = 0
     for (const v of votes ?? []) {
-      for (const name of v.voters ?? []) {
-        const i = opts.findIndex((o) => o.text === name)
-        if (i >= 0) opts[i].votes++
-      }
+      const i = entry.model.content.options.findIndex((o) => o.text === v.name)
+      if (i >= 0) entry.model.content.options[i].votes = v.voters?.length ?? 0
     }
     emit({ type: 'message_update', msg: entry.model })
   } catch { /* undecryptable vote — ignore */ }
@@ -552,25 +788,37 @@ function onMessagesUpdate(updates) {
     const chatId = norm(key.remoteJid)
     if (update?.message?.protocolMessage?.type === 14) { applyEdit({ key }, update.message.protocolMessage); continue }
     if (update?.message?.protocolMessage?.type === 0) { applyRevoke(chatId, update.message.protocolMessage.key?.id); continue }
+    if (update?.pollUpdates?.length) {
+      for (const pu of update.pollUpdates) void applyPollUpdate({ key: { remoteJid: chatId, participant: key.participant } }, pu)
+      continue
+    }
+    if (update?.starred != null) {
+      const entry = msgsOf(chatId).get(key.id)
+      if (entry) { entry.model.starred = update.starred; emit({ type: 'message_update', msg: entry.model }) }
+      continue
+    }
     if (update?.status == null) continue
     const delivery = STATUS[update.status]
     if (!delivery) continue
     const entry = msgsOf(chatId).get(key.id)
-    if (entry) entry.model.delivery = delivery
-    emit({ type: 'delivery', chatId, ids: [key.id], delivery })
+    if (entry && entry.model.delivery !== 'read' || delivery === 'read') {
+      if (entry) entry.model.delivery = delivery
+      emit({ type: 'delivery', chatId, ids: [key.id], delivery })
+    }
   }
 }
 
 function onMessagesDelete(del) {
-  const byChat = new Map()
+  // WhatsApp shows "This message was deleted" placeholders — tombstone, not removal
   for (const key of del.keys ?? []) {
     const chatId = norm(key.remoteJid)
     const entry = msgsOf(chatId).get(key.id)
-    if (entry) entry.model.content = { kind: 'deleted' }
-    if (!byChat.has(chatId)) byChat.set(chatId, [])
-    byChat.get(chatId).push(key.id)
+    if (entry) {
+      entry.model.content = { kind: 'deleted' }
+      entry.model.reactions = undefined
+      emit({ type: 'message_update', msg: entry.model })
+    }
   }
-  for (const [chatId, ids] of byChat) emit({ type: 'messages_removed', chatId, ids })
 }
 
 function onPresence({ id, presences }) {
@@ -596,6 +844,10 @@ function onPresence({ id, presences }) {
       const m = S.typingTimers.get(chatId)
       if (m?.delete(pjid)) emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
     }
+    if (state === 'unavailable' && p.lastSeen != null) {
+      const c = S.chats.get(chatId)
+      if (c) { c.lastSeen = Number(p.lastSeen) * 1000; emit({ type: 'chat_update', chat: c }) }
+    }
   }
 }
 
@@ -607,30 +859,50 @@ function queueAvatar(jid) {
   S.avatarQueued.add(jid)
   metaQueue.push(async () => {
     try {
+      // warm the /a/ proxy cache — do NOT expose the raw CDN url
+      // (it expires); the proxy resolves a fresh one per request
       const url = await S.sock.profilePictureUrl(jid, 'preview')
-      const chat = S.chats.get(jid)
-      if (url && chat) { chat.avatarUrl = url; emit({ type: 'chat_update', chat }) }
-      const c = S.contacts.get(jid)
-      if (url && c) c.avatarUrl = url
+      if (url) {
+        const r = await fetch(url)
+        if (r.ok) avatarCache.set(jid, { buf: Buffer.from(await r.arrayBuffer()), mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() })
+      }
     } catch { /* no picture */ }
   })
   kickMetaQueue()
 }
-function queueGroupMeta(jid) {
+const metaRetry = new Map() // jid -> attempts (ZapFast-style backoff)
+function queueGroupMeta(jid, attempt = 0) {
+  if (attempt === 0 && S.metaQueued.has(jid)) return
+  S.metaQueued.add(jid)
+  metaQueue.push(async () => {
+    try {
+      applyGroupMeta(await S.sock.groupMetadata(jid))
+      metaRetry.delete(jid)
+    } catch (e) {
+      const tries = (metaRetry.get(jid) ?? 0) + 1
+      metaRetry.set(jid, tries)
+      const msg = String(e?.message ?? e)
+      const final = /not-authorized|forbidden|item-not-found|404|401/.test(msg) || tries >= 7
+      S.metaQueued.delete(jid)
+      if (!final) setTimeout(() => queueGroupMeta(jid, tries), Math.min(30000 * 2 ** (tries - 1), 900000))
+    }
+  })
+  kickMetaQueue()
+}
+function queueNewsMeta(jid) {
   if (S.metaQueued.has(jid)) return
   S.metaQueued.add(jid)
   metaQueue.push(async () => {
     try {
-      const md = await S.sock.groupMetadata(jid)
+      const md = await S.sock.newsletterMetadata('jid', jid)
+      const name = md?.thread_metadata?.name?.text ?? md?.name?.text ?? md?.name
       const chat = S.chats.get(jid)
-      if (chat) {
-        chat.participants = md.participants.map((p) => norm(p.id))
-        chat.youAdmin = md.participants.some((p) => norm(p.id) === ownJid() && p.admin)
-        if (md.subject) chat.title = md.subject
+      if (name && chat && chat.title !== name) {
+        chat.title = name
         emit({ type: 'chat_update', chat })
       }
-      for (const p of md.participants) upsertContact({ id: p.id })
-    } catch { /* not a member / rate limited */ }
+      S.metaQueued.delete(jid)
+    } catch (e) { S.metaQueued.delete(jid); log('newsletter meta failed:', e?.message) }
   })
   kickMetaQueue()
 }
@@ -644,6 +916,35 @@ async function kickMetaQueue() {
   metaRunning = false
 }
 
+// ---------- on-demand history (ZapFast-style: ask the phone when a chat
+// loads empty — mirrors "anchor at the present with an empty message id") ----------
+const requestedHistory = new Set()
+async function requestHistory(chatId, count = 80) {
+  const jid = norm(chatId)
+  if (!S.open || !jid || !S.sock?.fetchMessageHistory) return false
+  const bucket = msgsOf(jid)
+  const oldest = bucket.size
+    ? [...bucket.values()].reduce((a, b) => (Number(a.proto.messageTimestamp) < Number(b.proto.messageTimestamp) ? a : b))
+    : null
+  const key = oldest?.proto?.key ?? { remoteJid: jid, id: '', fromMe: false }
+  const tsMs = oldest ? Number(oldest.proto.messageTimestamp) * 1000 : Date.now()
+  const tag = `${jid}:${key.id || 'head'}`
+  if (requestedHistory.has(tag)) return false
+  requestedHistory.add(tag)
+  // if the phone is offline the answer simply never comes — let the request
+  // be retried instead of deduped forever
+  setTimeout(() => requestedHistory.delete(tag), 60_000)
+  try {
+    await S.sock.fetchMessageHistory(count, key, tsMs)
+    log(`history request sent (${count} msgs)`)
+    return true
+  } catch (e) {
+    requestedHistory.delete(tag)
+    log(`history request failed: ${e?.message}`)
+    return false
+  }
+}
+
 // ---------- snapshot ----------
 function snapshot() {
   const chats = [...S.chats.values()].sort((a, b) => b.lastActivity - a.lastActivity)
@@ -654,6 +955,7 @@ function snapshot() {
   }
   const unreadTotal = chats.reduce((n, c) => n + (c.muted ? 0 : c.unread), 0)
   return {
+    linked: !!S.me,
     account: { id: 'me', name: S.me?.name ?? 'Me', phone: S.me?.phone, avatarHue: hue(S.me?.id ?? 'me'), unreadTotal },
     chats,
     contacts: [...S.contacts.values()],
@@ -681,11 +983,20 @@ const CMDS = {
     // wipe regardless — the user asked to unpair this device
     S.me = null
     S.historyDone = false
-    S.chats.clear(); S.msgs.clear(); S.contacts.clear(); S.flags.starred.clear()
+    readyEmitted = false
+    requestedHistory.clear()
+    S.subscribedPresence.clear()
+    S.typingTimers.clear()
+    S.chats.clear(); S.msgs.clear(); S.contacts.clear()
+    S.flags.favorite.clear(); S.flags.unread.clear(); S.flags.starred.clear(); saveFlags()
+    S.lidToPn.clear(); S.pushNames.clear()
     S.authState = null
     try { S.sock?.end?.(undefined) } catch { /* already closed */ }
     S.sock = null
+    stateDirty = false
     fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+    fs.rmSync(STATE_FILE, { force: true })
+    fs.rmSync(MEDIA_DIR, { recursive: true, force: true })
     fs.mkdirSync(AUTH_DIR, { recursive: true })
     setTimeout(ensureSocket, 400) // fresh socket → new QR
     return { ok: true }
@@ -693,10 +1004,16 @@ const CMDS = {
 
   async loadOlder({ chatId, beforeTs, limit }) {
     const arr = sortedMsgs(chatId)
+    if (!arr.length) {
+      // phone holds the history — ask for it; arrives as ON_DEMAND history.set
+      void requestHistory(chatId, 100)
+      return { messages: [], hasMore: true }
+    }
     const idx = arr.findIndex((m) => m.ts >= beforeTs)
     const end = idx === -1 ? arr.length : idx
     const start = Math.max(0, end - limit)
-    return { messages: arr.slice(start, end), hasMore: start > 0 }
+    const asked = start === 0 && requestHistory(chatId, 100)
+    return { messages: arr.slice(start, end), hasMore: start > 0 || !!asked }
   },
 
   async searchMessages({ chatId, query }) {
@@ -749,12 +1066,16 @@ const CMDS = {
       const key = findKey(chatId, id)
       if (forEveryone && key) {
         try { await S.sock.sendMessage(norm(chatId), { delete: key }) } catch { /* revoked server-side anyway */ }
-      }
-      const entry = msgsOf(chatId).get(id)
-      if (entry) {
-        entry.model.content = { kind: 'deleted' }
-        entry.model.reactions = undefined
-        emit({ type: 'message_update', msg: entry.model })
+        const entry = msgsOf(chatId).get(id)
+        if (entry) {
+          entry.model.content = { kind: 'deleted' }
+          entry.model.reactions = undefined
+          emit({ type: 'message_update', msg: entry.model })
+        }
+      } else {
+        // delete-for-me: WhatsApp removes the row entirely
+        msgsOf(chatId).delete(id)
+        emit({ type: 'messages_removed', chatId, ids: [id] })
       }
     }
   },
@@ -812,12 +1133,22 @@ const CMDS = {
       chat = upsertChat({ id: jid })
       emit({ type: 'chat_update', chat })
     }
+    // live presence for the open chat + pull history if we have none yet
+    try { await S.sock?.presenceSubscribe(jid) } catch { /* offline */ }
+    if (!msgsOf(jid).size) void requestHistory(jid, 80)
     return chat
   },
 
   async markRead({ chatId }) {
     const key = S.lastKey.get(chatId)
     if (key) { try { await S.sock.readMessages([key]) } catch { /* receipt best-effort */ } }
+    // presence subscribe once per session per direct chat — the UI calls
+    // markRead on every open, so this is the reliable hook point
+    const jid = norm(chatId)
+    if (!jid.endsWith('@g.us') && !S.subscribedPresence.has(jid)) {
+      S.subscribedPresence.add(jid)
+      void S.sock?.presenceSubscribe(jid).catch(() => {})
+    }
     const chat = S.chats.get(chatId)
     if (chat) {
       chat.unread = 0
@@ -849,8 +1180,10 @@ const CMDS = {
       if (flag === 'pinned') await S.sock.chatModify({ pin: value }, jid)
       else if (flag === 'muted') await S.sock.chatModify({ mute: value ? 8 * 3600 * 1000 * 24 * 365 : null }, jid)
       else if (flag === 'archived') {
-        const last = S.lastKey.get(chatId)
-        await S.sock.chatModify({ archive: value, lastMessages: last ? [{ key: last, messageTimestamp: Math.floor(Date.now() / 1000) }] : [] }, jid)
+        const newest = sortedMsgs(chatId).at(-1)
+        const lastKey = newest && msgsOf(chatId).get(newest.id)?.proto?.key
+        const lastTs = newest ? Math.floor(newest.ts / 1000) : Math.floor(Date.now() / 1000)
+        await S.sock.chatModify({ archive: value, lastMessages: lastKey ? [{ key: lastKey, messageTimestamp: lastTs }] : [] }, jid)
       }
     } catch { /* flag stays local if WhatsApp refuses */ }
     if (flag === 'favorite') {
@@ -858,6 +1191,7 @@ const CMDS = {
       saveFlags()
     }
     chat[flag] = value
+    markDirty()
     emit({ type: 'chat_update', chat })
   },
 
@@ -871,13 +1205,77 @@ const CMDS = {
     }
   },
 
+  // real privacy settings — mirrors WhatsApp's own toggles
+  async setPrivacy({ setting, value }) {
+    const map = {
+      lastSeen: 'updateLastSeenPrivacy',
+      profilePhoto: 'updateProfilePicturePrivacy',
+      groupsAdd: 'updateGroupsAddPrivacy',
+      readReceipts: 'updateReadReceiptsPrivacy', // 'all' | 'none'
+      status: 'updateStatusPrivacy',
+    }
+    const fn = map[setting]
+    if (!fn || !S.sock?.[fn]) return { error: 'unsupported' }
+    await S.sock[fn](value)
+    return { ok: true }
+  },
+
+  async blocklist() {
+    try { return { jids: await S.sock.fetchBlocklist() } } catch { return { jids: [] } }
+  },
+
+  async leaveGroup({ chatId }) {
+    await S.sock.groupLeave(norm(chatId))
+    const chat = S.chats.get(norm(chatId))
+    if (chat) { S.chats.delete(norm(chatId)); emit({ type: 'chat_update', chat: { ...chat, kind: 'dm', title: chat.title + ' (left)' } }) }
+    return { ok: true }
+  },
+
+  async pinMessage({ chatId, messageId, pin }) {
+    const key = findKey(chatId, messageId)
+    if (!key) return { error: 'not found' }
+    try {
+      await S.sock.sendMessage(norm(chatId), { pin: key, type: pin ? 1 : 2, time: 604800 })
+      const chat = S.chats.get(norm(chatId))
+      if (chat) {
+        chat.pinnedMessageId = pin ? messageId : undefined
+        emit({ type: 'chat_update', chat })
+      }
+    } catch (e) { return { error: e?.message } }
+    return { ok: true }
+  },
+
+  async storageStats() {
+    let bytes = 0, files = 0
+    try {
+      for (const f of fs.readdirSync(MEDIA_DIR)) {
+        const st = fs.statSync(path.join(MEDIA_DIR, f))
+        if (st.isFile()) { bytes += st.size; files++ }
+      }
+    } catch { /* dir missing */ }
+    return { bytes, files }
+  },
+
+  async clearCache() {
+    let freed = 0
+    try {
+      for (const f of fs.readdirSync(MEDIA_DIR)) {
+        const p = path.join(MEDIA_DIR, f)
+        freed += fs.statSync(p).size
+        fs.rmSync(p, { force: true })
+      }
+    } catch { /* partial clear is fine */ }
+    avatarCache.clear()
+    return { freed }
+  },
+
   async download({ chatId, messageId }) {
     const entry = msgsOf(chatId).get(messageId)
     if (!entry) return { error: 'not found' }
     const buf = await mediaBuffer(chatId, messageId)
     if (!buf) return { error: 'unavailable' }
-    const name = mediaFileName(entry.proto) ?? `${messageId}.bin`
-    const out = path.join(MEDIA_DIR, `${messageId}-${name}`)
+    const name = path.basename(mediaFileName(entry.proto) ?? `${messageId}.bin`).replace(/[^\w .()\[\]-]/g, '_')
+    const out = path.join(MEDIA_DIR, `${messageId.slice(0, 24)}-${name}`)
     fs.writeFileSync(out, buf)
     return { path: out }
   },
@@ -909,7 +1307,8 @@ async function outPayload(content) {
     case 'audio': {
       const b = buf(content.url ?? content.dataUrl)
       if (!b) return null
-      return { audio: b, ptt: content.voice !== false, mimetype: 'audio/ogg; codecs=opus' }
+      const declared = /^data:([^;,]+)/.exec(content.url ?? content.dataUrl ?? '')?.[1]
+      return { audio: b, ptt: content.voice !== false, mimetype: declared ?? 'audio/ogg; codecs=opus' }
     }
     case 'poll':
       return {
@@ -955,18 +1354,55 @@ function mediaMime(chatId, messageId) {
   return c.mimetype ?? 'application/octet-stream'
 }
 
+const avatarCache = new Map() // jid -> {buf, mime, at}
 const mediaServer = http.createServer(async (req, res) => {
+  if (!DEV && /[?&]token=([^&]+)/.exec(req.url ?? '')?.[1] !== TOKEN) { res.writeHead(403).end(); return }
+  const av = /^\/a\/([^/?]+)/.exec(req.url ?? '')
+  if (av) {
+    const jid = decodeURIComponent(av[1])
+    try {
+      const hit = avatarCache.get(jid)
+      if (hit && Date.now() - hit.at < 300_000) {
+        res.writeHead(200, { 'content-type': hit.mime, 'cache-control': 'private, max-age=300' })
+        res.end(hit.buf)
+        return
+      }
+      const url = await S.sock?.profilePictureUrl(jid, 'image')
+      if (!url) throw new Error('none')
+      const r = await fetch(url)
+      if (!r.ok) throw new Error('fetch ' + r.status)
+      const buf = Buffer.from(await r.arrayBuffer())
+      avatarCache.set(jid, { buf, mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() })
+      res.writeHead(200, { 'content-type': avatarCache.get(jid).mime, 'cache-control': 'private, max-age=300' })
+      res.end(buf)
+    } catch {
+      if (avatarCache.has(jid)) { // stale beats nothing
+        const hit = avatarCache.get(jid)
+        res.writeHead(200, { 'content-type': hit.mime }); res.end(hit.buf); return
+      }
+      res.writeHead(404).end()
+    }
+    return
+  }
   const m = /^\/m\/([^/]+)\/([^/?]+)/.exec(req.url ?? '')
   if (!m) { res.writeHead(404).end(); return }
   const [, chatId, msgId] = m.map(decodeURIComponent)
   const buf = await mediaBuffer(chatId, msgId)
   if (!buf) { res.writeHead(404).end(); return }
-  res.writeHead(200, { 'content-type': mediaMime(chatId, msgId), 'cache-control': 'private, max-age=86400', 'access-control-allow-origin': '*' })
+  res.writeHead(200, { 'content-type': mediaMime(chatId, msgId), 'cache-control': 'private, max-age=86400' })
   res.end(buf)
 })
 
 // ---------- websocket ----------
-const wss = new WebSocketServer({ host: HOST, port: WS_PORT })
+const wss = new WebSocketServer({
+  host: HOST,
+  port: WS_PORT,
+  verifyClient: (info, done) => {
+    if (DEV) return done(true)
+    const token = /[?&]token=([^&]+)/.exec(info.req.url ?? '')?.[1]
+    done(token === TOKEN)
+  },
+})
 wss.on('error', (e) => {
   // another daemon already owns the ports — leave quietly, don't fight it
   log(`ws server error: ${e.message ?? e}`)
@@ -996,6 +1432,10 @@ mediaServer.on('error', () => { /* another daemon owns it — ws error handler e
 mediaServer.listen(MEDIA_PORT, HOST, () => {
   log(`ws://${HOST}:${WS_PORT}  media http://${HOST}:${MEDIA_PORT}  data=${DATA}`)
 })
+// flush the durable state on shutdown — the archive is the only copy
+process.on('exit', () => { if (stateDirty) { try { stateTimer && clearTimeout(stateTimer); writeState() } catch {} } })
+process.on('SIGINT', () => process.exit(0))
+process.on('SIGTERM', () => process.exit(0))
 
 process.on('SIGTERM', () => process.exit(0))
 process.on('SIGINT', () => process.exit(0))

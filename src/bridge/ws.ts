@@ -61,6 +61,18 @@ export class WsAdapter implements ClientAdapter {
     for (const cb of this.cbs) cb(e)
   }
 
+  private lastErrToast = 0
+  /** fire-and-forget command that surfaces failures as bridge_error events */
+  private sendCmd(cmd: string, args: Record<string, unknown> = {}) {
+    this.call(cmd, args).catch((e) => {
+      const now = Date.now()
+      if (now - this.lastErrToast > 2500) {
+        this.lastErrToast = now
+        this.push({ type: 'bridge_error', message: e?.message ?? 'Command failed' })
+      }
+    })
+  }
+
   private async call<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
     await this.openP
     const id = ++this.seq
@@ -78,22 +90,22 @@ export class WsAdapter implements ClientAdapter {
     return this.call<Message[]>('searchMessages', { chatId, query })
   }
   send(chatId: Id, content: OutContent, replyTo?: ReplyRef) {
-    void this.call('send', { chatId, content, replyTo })
+    this.sendCmd('send', { chatId, content, replyTo })
   }
   edit(chatId: Id, messageId: Id, text: string) {
-    void this.call('edit', { chatId, messageId, text })
+    this.sendCmd('edit', { chatId, messageId, text })
   }
   delete(chatId: Id, messageIds: Id[], forEveryone: boolean) {
-    void this.call('delete', { chatId, messageIds, forEveryone })
+    this.sendCmd('delete', { chatId, messageIds, forEveryone })
   }
   react(chatId: Id, messageId: Id, emoji: string | null) {
-    void this.call('react', { chatId, messageId, emoji })
+    this.sendCmd('react', { chatId, messageId, emoji })
   }
   forward(toChatIds: Id[], messageIds: Id[]) {
-    void this.call('forward', { toChatIds, messageIds })
+    this.sendCmd('forward', { toChatIds, messageIds })
   }
   star(chatId: Id, messageIds: Id[], starred: boolean) {
-    void this.call('star', { chatId, messageIds, starred })
+    this.sendCmd('star', { chatId, messageIds, starred })
   }
   searchAll(query: string) {
     return this.call<Message[]>('searchAll', { query })
@@ -101,16 +113,27 @@ export class WsAdapter implements ClientAdapter {
   openChat(contactId: Id) {
     return this.call<import('./types').Chat>('openChat', { contactId })
   }
-  markRead(chatId: Id) { void this.call('markRead', { chatId }) }
-  markUnread(chatId: Id, value: boolean) { void this.call('markUnread', { chatId, value }) }
-  setTyping(chatId: Id, typing: boolean) { void this.call('setTyping', { chatId, typing }) }
+  markRead(chatId: Id) { this.sendCmd('markRead', { chatId }) }
+  markUnread(chatId: Id, value: boolean) { this.sendCmd('markUnread', { chatId, value }) }
+  setTyping(chatId: Id, typing: boolean) { this.sendCmd('setTyping', { chatId, typing }) }
   setChatFlag(chatId: Id, flag: string, value: boolean) {
-    void this.call('setChatFlag', { chatId, flag, value })
+    this.sendCmd('setChatFlag', { chatId, flag, value })
   }
   vote(chatId: Id, messageId: Id, optionIndexes: number[]) {
-    void this.call('vote', { chatId, messageId, optionIndexes })
+    this.sendCmd('vote', { chatId, messageId, optionIndexes })
   }
-  logout() { void this.call('logout') }
+  logout() { this.sendCmd('logout') }
+  pinMessage(chatId: Id, messageId: Id, pin: boolean) {
+    this.sendCmd('pinMessage', { chatId, messageId, pin })
+  }
+  leaveGroup(chatId: Id) { return this.call<void>('leaveGroup', { chatId }) }
+  setPrivacy(setting: string, value: string) { void this.call('setPrivacy', { setting, value }) }
+  blocklist() { return this.call<{ jids: string[] }>('blocklist').then((r) => r.jids) }
+  storageStats() { return this.call<{ bytes: number; files: number }>('storageStats') }
+  clearCache() { return this.call<{ freed: number }>('clearCache').then((r) => r.freed) }
+  download(chatId: Id, messageId: Id) {
+    return this.call<{ path?: string; error?: string }>('download', { chatId, messageId })
+  }
   onEvent(cb: (e: ServerEvent) => void) {
     this.cbs.add(cb)
     return () => this.cbs.delete(cb)

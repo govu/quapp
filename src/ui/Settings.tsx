@@ -1,10 +1,10 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   Bell, ChatCircle, Database, Info, Keyboard, Lock, PaintBrush, User, X,
 } from '@phosphor-icons/react'
 import { cx, spring } from '../lib/util'
-import { logout, setSettingsOpen, updateSettings, useStore, type Accent } from '../store'
+import { logout, setSettingsOpen, toast, updateSettings, useStore, type Accent, type Settings } from '../store'
 import { Avatar, Dialog, DialogButton, SquircleIcon } from './common'
 
 type SectionId = 'account' | 'appearance' | 'chats' | 'notifications' | 'privacy' | 'storage' | 'shortcuts' | 'about'
@@ -323,59 +323,85 @@ function ChatsSection() {
           />
         } />
       </Group>
-      <Group>
-        <Row label="Chat backup" hint="Encrypted, stored on this device only" control={<span className="text-[13px] text-[var(--label-3)]">2.1 GB</span>} />
-        <Row label="Export chat" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
-      </Group>
     </div>
   )
 }
 
 function NotificationsSection() {
-  const [sound, setSound] = useState(true)
-  const [preview, setPreview] = useState(true)
-  const [badge, setBadge] = useState(true)
+  const settings = useStore((s) => s.settings)
+  const demoMode = useStore((s) => s.demoMode)
   return (
     <div>
       <SectionTitle>Notifications</SectionTitle>
       <Group>
-        <Row label="Sounds" control={<Toggle on={sound} onChange={setSound} />} />
-        <Row label="Show message preview" hint="Off: notifications show the sender only" control={<Toggle on={preview} onChange={setPreview} />} />
-        <Row label="Dock badge" hint="Unread count on the app icon" control={<Toggle on={badge} onChange={setBadge} />} />
+        <Row
+          label="Desktop notifications"
+          hint={demoMode ? 'Enable real pairing to receive them' : 'Windows toast notifications for new messages'}
+          control={<Toggle on={settings.notifications} onChange={(v) => updateSettings({ notifications: v })} />}
+        />
+        <Row label="Sounds" hint="Play a tone for incoming messages" control={<Toggle on={settings.notifSound} onChange={(v) => updateSettings({ notifSound: v })} />} />
+        <Row label="Show message preview" hint="Off: notifications show the sender only" control={<Toggle on={settings.notifPreview} onChange={(v) => updateSettings({ notifPreview: v })} />} />
       </Group>
       <Group>
-        <Row label="Muted chats" hint="Badges stay, sounds are off" control={<span className="text-[13px] text-[var(--label-3)]">›</span>} />
+        <Row label="Unread badge" hint="The window title shows the unread count" control={<span className="text-[13px] text-[var(--label-3)]">Always on</span>} />
       </Group>
     </div>
   )
+}
+
+type PrivacyKey = 'privLastSeen' | 'privPhoto' | 'privGroups'
+const PRIVACY_SETTING: Record<PrivacyKey, 'lastSeen' | 'profilePhoto' | 'groupsAdd'> = {
+  privLastSeen: 'lastSeen',
+  privPhoto: 'profilePhoto',
+  privGroups: 'groupsAdd',
 }
 
 function PrivacySection() {
   const settings = useStore((s) => s.settings)
-  const [lastSeen, setLastSeen] = useState('contacts')
-  const [photo, setPhoto] = useState('everyone')
-  const [groups, setGroups] = useState('contacts')
+  const demoMode = useStore((s) => s.demoMode)
+  const adapter = useStore((s) => s.adapter)
+  const [blocked, setBlocked] = useState<number | null>(null)
+
+  useEffect(() => {
+    adapter?.blocklist?.().then((jids) => setBlocked(jids.length)).catch(() => setBlocked(0))
+  }, [adapter])
+
+  const setPriv = (key: PrivacyKey, value: Settings[PrivacyKey]) => {
+    updateSettings({ [key]: value })
+    adapter?.setPrivacy?.(PRIVACY_SETTING[key], value === 'nobody' ? 'none' : value)
+  }
+
   return (
     <div>
       <SectionTitle>Privacy</SectionTitle>
       <Group>
-        <Row label="Read receipts" hint="Blue ticks. Off: you also can't see theirs" control={<Toggle on={settings.readReceipts} onChange={(v) => updateSettings({ readReceipts: v })} />} />
+        <Row
+          label="Read receipts"
+          hint="Blue ticks. Off: you also can't see theirs"
+          control={
+            <Toggle
+              on={settings.readReceipts}
+              onChange={(v) => {
+                updateSettings({ readReceipts: v })
+                adapter?.setPrivacy?.('readReceipts', v ? 'all' : 'none')
+              }}
+            />
+          }
+        />
       </Group>
       <Group>
-        <Row label="Last seen & online" control={<PrivacyPick v={lastSeen} set={setLastSeen} />} />
-        <Row label="Profile photo" control={<PrivacyPick v={photo} set={setPhoto} />} />
-        <Row label="Groups" hint="Who can add you" control={<PrivacyPick v={groups} set={setGroups} />} />
+        <Row label="Last seen & online" hint={demoMode ? 'Synced to WhatsApp when linked' : undefined} control={<PrivacyPick v={settings.privLastSeen} set={(v) => setPriv('privLastSeen', v)} />} />
+        <Row label="Profile photo" control={<PrivacyPick v={settings.privPhoto} set={(v) => setPriv('privPhoto', v)} />} />
+        <Row label="Groups" hint="Who can add you" control={<PrivacyPick v={settings.privGroups} set={(v) => setPriv('privGroups', v)} />} />
       </Group>
       <Group>
-        <Row label="Blocked contacts" control={<span className="text-[13px] tabular-nums text-[var(--label-3)]">0</span>} />
-        <Row label="Disappearing messages" control={<span className="text-[13px] text-[var(--label-3)]">Off</span>} />
-        <Row label="App lock" hint="Require Touch ID to open Quapp" control={<Toggle on={false} onChange={() => {}} />} />
+        <Row label="Blocked contacts" control={<span className="text-[13px] tabular-nums text-[var(--label-3)]">{blocked ?? '—'}</span>} />
       </Group>
     </div>
   )
 }
 
-function PrivacyPick({ v, set }: { v: string; set: (x: string) => void }) {
+function PrivacyPick({ v, set }: { v: 'everyone' | 'contacts' | 'nobody'; set: (x: 'everyone' | 'contacts' | 'nobody') => void }) {
   return (
     <Segmented
       value={v}
@@ -389,37 +415,72 @@ function PrivacyPick({ v, set }: { v: string; set: (x: string) => void }) {
   )
 }
 
+function fmtBytes(n: number) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)} KB`
+  return `${n} B`
+}
+
 function StorageSection() {
+  const settings = useStore((s) => s.settings)
+  const adapter = useStore((s) => s.adapter)
+  const [stats, setStats] = useState<{ bytes: number; files: number } | null>(null)
+  const [clearing, setClearing] = useState(false)
+
+  useEffect(() => {
+    adapter?.storageStats?.().then(setStats).catch(() => setStats(null))
+  }, [adapter])
+
+  const clear = async () => {
+    if (!adapter?.clearCache) return
+    setClearing(true)
+    try {
+      const freed = await adapter.clearCache()
+      toast(`Freed ${fmtBytes(freed)}`, 'check')
+      const s = await adapter.storageStats?.()
+      if (s) setStats(s)
+    } catch {
+      toast("Couldn't clear the cache", 'error')
+    } finally {
+      setClearing(false)
+    }
+  }
+
   return (
     <div>
       <SectionTitle>Storage</SectionTitle>
       <Group>
         <div>
           <div className="mb-2 flex items-baseline justify-between">
-            <span className="text-[13.5px]">2.1 GB used</span>
-            <span className="text-[12px] text-[var(--label-3)]">of 8 GB archive</span>
+            <span className="text-[13.5px]">{stats ? fmtBytes(stats.bytes) : '—'} cached media</span>
+            <span className="text-[12px] text-[var(--label-3)]">{stats ? `${stats.files} files` : ''}</span>
           </div>
           <div className="h-2 overflow-hidden rounded-full bg-[var(--fill-3)]">
-            <div className="flex h-full">
-              <span className="h-full bg-[var(--blue)]" style={{ width: '46%' }} />
-              <span className="h-full bg-[var(--green)]" style={{ width: '18%' }} />
-              <span className="h-full bg-[var(--orange)]" style={{ width: '9%' }} />
-            </div>
+            <div
+              className="h-full bg-[var(--blue)] transition-all duration-500"
+              style={{ width: `${Math.min(100, Math.max(2, ((stats?.bytes ?? 0) / (4e9)) * 100))}%` }}
+            />
           </div>
-          <div className="mt-2 flex gap-4 text-[11.5px] text-[var(--label-2)]">
-            <span className="flex items-center gap-1"><i className="size-2 rounded-full bg-[var(--blue)]" /> Photos</span>
-            <span className="flex items-center gap-1"><i className="size-2 rounded-full bg-[var(--green)]" /> Videos</span>
-            <span className="flex items-center gap-1"><i className="size-2 rounded-full bg-[var(--orange)]" /> Documents</span>
+          <div className="mt-2 text-[11.5px] text-[var(--label-2)]">
+            Messages and media stay encrypted on this PC — the cache re-downloads on demand.
           </div>
         </div>
       </Group>
       <Group>
-        <Row label="Auto-download photos" control={<Toggle on={true} onChange={() => {}} />} />
-        <Row label="Auto-download videos" control={<Toggle on={false} onChange={() => {}} />} />
-        <Row label="Auto-download documents" control={<Toggle on={true} onChange={() => {}} />} />
+        <Row label="Auto-download photos" hint="Fetch attachments when a chat opens" control={<Toggle on={settings.autoDlPhotos} onChange={(v) => updateSettings({ autoDlPhotos: v })} />} />
+        <Row label="Auto-download documents" control={<Toggle on={settings.autoDlDocs} onChange={(v) => updateSettings({ autoDlDocs: v })} />} />
       </Group>
       <Group>
-        <Row label="Clear cache" hint="Media stays in the archive" control={<button className="press rounded-[7px] px-2.5 py-1 text-[13px] font-medium text-[var(--blue)] hover:bg-[var(--blue)]/10">Clear</button>} />
+        <Row
+          label="Clear media cache"
+          hint="Deletes downloaded photos, videos and documents — re-fetched on demand"
+          control={
+            <button onClick={() => void clear()} disabled={clearing} className="press rounded-[7px] px-2.5 py-1 text-[13px] font-medium text-[var(--blue)] hover:bg-[var(--blue)]/10 disabled:opacity-40">
+              {clearing ? 'Clearing…' : 'Clear'}
+            </button>
+          }
+        />
       </Group>
     </div>
   )
@@ -459,9 +520,9 @@ function AboutSection() {
           <svg width="38" height="38" viewBox="0 0 64 64"><path d="M32 13c-8.8 0-16 6.3-16 14 0 4.4 2.1 8.4 5.5 11L20 45l7.6-2.4c1.4.3 2.9.4 4.4.4 8.8 0 16-6.3 16-14S40.8 13 32 13z" fill="#fff" /></svg>
         </div>
         <div className="mt-3 text-[19px] font-semibold">Quapp</div>
-        <div className="mt-0.5 text-[13px] text-[var(--label-2)]">Version 1.0</div>
+        <div className="mt-0.5 text-[13px] text-[var(--label-2)]">Version 0.1.0</div>
         <div className="mt-4 max-w-[320px] text-[12.5px] leading-relaxed text-[var(--label-3)]">
-          A native-speed WhatsApp client. Your messages stay on this device, encrypted with SQLCipher. No analytics, no middleman servers.
+          A fast, minimal WhatsApp client for Windows. Chats and media stay on this PC — nothing is sent to third-party servers.
         </div>
       </div>
     </div>

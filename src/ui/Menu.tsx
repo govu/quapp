@@ -11,6 +11,8 @@ export interface MenuItem {
   onClick?: () => void
   separatorAbove?: boolean
   trailing?: ReactNode
+  /** don't render this item at all (conditional menu entries) */
+  hidden?: boolean
 }
 
 interface MenuState {
@@ -37,7 +39,7 @@ export function ContextMenuHost() {
   useLayoutEffect(() => {
     openMenu = (m) => {
       setMenu(m)
-      const w = 240, h = (m.reactions ? 52 : 0) + m.items.length * 34 + 16
+      const w = 240, h = (m.reactions ? 52 : 0) + m.items.filter((i) => !i.hidden).length * 34 + m.items.filter((i) => i.separatorAbove && !i.hidden).length * 9 + 16
       const x = Math.min(m.x, window.innerWidth - w - 8)
       const y = Math.min(m.y, window.innerHeight - h - 8)
       setPos({ x, y, ox: m.x - x, oy: m.y - y })
@@ -87,7 +89,7 @@ export function ContextMenuHost() {
               ))}
             </div>
           )}
-          {menu.items.map((it, i) => (
+          {menu.items.filter((it) => !it.hidden).map((it, i) => (
             <div key={i}>
               {it.separatorAbove && <div className="mx-3 my-1 border-t border-[var(--separator)]" />}
               <button

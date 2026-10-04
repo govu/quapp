@@ -27,6 +27,19 @@ function daemonPath() {
 }
 
 const daemonLog = () => path.join(app.getPath('userData'), 'quappd-spawn.log')
+// per-launch token the daemon writes to <data>/token.txt; the renderer needs
+// it to connect — read with a small retry since the daemon writes on boot
+function daemonToken() {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const t = fs.readFileSync(path.join(app.getPath('userData'), 'quappd', 'token.txt'), 'utf8').trim()
+      if (t) return t
+    } catch { /* not written yet */ }
+    const end = Date.now() + 250
+    while (Date.now() < end) { /* spin — boot-time, sub-second */ }
+  }
+  return ''
+}
 const dlog = (line) => {
   try { fs.appendFileSync(daemonLog(), `[${new Date().toISOString()}] ${line}\n`) } catch { /* ignore */ }
 }
@@ -44,6 +57,7 @@ function startDaemon() {
         QUAPP_WS_PORT: '8765',
         QUAPP_MEDIA_PORT: '8766',
         QUAPP_DATA: path.join(app.getPath('userData'), 'quappd'),
+        QUAPPD_DEV: isDev ? '1' : '0',
       },
       silent: true,
     })
@@ -99,7 +113,7 @@ function createWindow() {
   Menu.setApplicationMenu(null)
 
   if (isDev) win.loadURL(DEV_URL)
-  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: { token: daemonToken() } })
 }
 
 app.whenReady().then(() => {

@@ -7,7 +7,7 @@ import {
 import type { Chat } from '../bridge/types'
 import { cx, spring } from '../lib/util'
 import {
-  clearSelection, doDelete, doFlag, doMarkUnread, setForwarding, setPane, useStore,
+  clearSelection, doDelete, doFlag, doMarkUnread, setForwarding, setPane, toast, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { MessageList } from './MessageList'
@@ -21,6 +21,9 @@ export function Conversation() {
   const pane = useStore((s) => s.pane)
   const selection = useStore((s) => s.selection !== null)
   const wallpaper = useStore((s) => s.settings.wallpaper)
+  // captured at open-time before markRead zeroed the badge — keeps the
+  // "Unread messages" divider anchored
+  const openUnread = useStore((s) => s.openUnread)
 
   if (!chat || !activeChat) {
     return <EmptyState />
@@ -31,7 +34,7 @@ export function Conversation() {
       {selection ? <SelectionBar chat={chat} /> : <Header chat={chat} />}
 
       <div className={cx('relative min-h-0 flex-1', wallClass(wallpaper))}>
-        <MessageList key={chat.id} chat={chat} initialUnread={chat.unread} />
+        <MessageList key={chat.id} chat={chat} initialUnread={openUnread} />
       </div>
 
       <Composer chat={chat} />
@@ -95,8 +98,8 @@ function Header({ chat }: { chat: Chat }) {
       <div className="ml-auto flex items-center gap-0.5">
         {chat.kind !== 'channel' && chat.kind !== 'saved' && (
           <>
-            <IconBtn label="Voice call"><Phone size={19} /></IconBtn>
-            <IconBtn label="Video call"><VideoCamera size={21} /></IconBtn>
+            <IconBtn label="Voice call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')}><Phone size={19} /></IconBtn>
+            <IconBtn label="Video call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')}><VideoCamera size={21} /></IconBtn>
           </>
         )}
         <IconBtn label="Search in chat" active={pane === 'search'} onClick={() => setPane(pane === 'search' ? null : 'search')}>

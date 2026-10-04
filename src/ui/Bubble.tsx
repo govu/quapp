@@ -3,13 +3,13 @@ import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   ArrowBendUpLeft, ArrowClockwise, ArrowCounterClockwise,
-  Check, Checks, Clock, Copy, DotsThree, FileText, Share, MapPin,
+  Check, Checks, Clock, Copy, DotsThree, FileText, PushPin, Share, MapPin,
   PencilSimple, Play, SelectionAll, Smiley, Star, Trash, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
 import { cx, durationLabel, fileSize, isEmojiOnly, renderMarkup, spring, timeLabel } from '../lib/util'
 import {
-  doDelete, doReact, doStar, doVote, setEditing, setForwarding, setReplyTo, startSelection, toggleSelect, useStore,
+  doDelete, doPinMessage, doReact, doStar, doVote, jumpTo, setEditing, setForwarding, setReplyTo, startSelection, toggleSelect, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { showContextMenu } from './Menu'
@@ -76,12 +76,13 @@ function MetaOverlay({ m }: { m: Message }) {
   )
 }
 
-function Quote({ m, out }: { m: NonNullable<Message['replyTo']>; out: boolean }) {
+function Quote({ m, out, chatId }: { m: NonNullable<Message['replyTo']>; out: boolean; chatId: string }) {
   return (
     <div
+      onClick={() => void jumpTo(chatId, m.id)}
       className={cx(
         'mb-1.5 flex cursor-pointer gap-2 overflow-hidden rounded-[10px] py-1.5 pl-2.5 pr-3 text-[13px]',
-        out ? 'bg-white/[0.16]' : 'bg-black/[0.05] dark:bg-white/[0.07]',
+        out ? 'bg-white/[0.16] hover:bg-white/[0.22]' : 'bg-black/[0.05] hover:bg-black/[0.08] dark:bg-white/[0.07] dark:hover:bg-white/[0.11]',
       )}
       style={{ borderLeft: `3px solid ${out ? 'rgba(255,255,255,0.75)' : 'var(--blue)'}` }}
     >
@@ -158,6 +159,10 @@ function Lightbox({ url, caption, onClose }: { url: string; caption?: string; on
   )
 }
 
+function safeHost(url: string): string {
+  try { return new URL(url).hostname } catch { return url.slice(0, 40) }
+}
+
 // ---------- content renderers ----------
 function TextContent({ m, out }: { m: Message; out: boolean }) {
   const c = m.content as Extract<Message['content'], { kind: 'text' }>
@@ -178,7 +183,7 @@ function TextContent({ m, out }: { m: Message; out: boolean }) {
           <div className={cx('px-3 py-2 text-[13px]', out ? 'text-white' : '')} style={{ borderLeft: '3px solid var(--green)' }}>
             <div className="font-semibold">{c.linkPreview.title}</div>
             {c.linkPreview.description && <div className={cx('line-clamp-2', out ? 'text-white/75' : 'text-[var(--label-2)]')}>{c.linkPreview.description}</div>}
-            <div className={cx('mt-0.5 text-[11px] uppercase tracking-wide', out ? 'text-white/60' : 'text-[var(--label-3)]')}>{c.linkPreview.site ?? new URL(c.linkPreview.url).hostname}</div>
+            <div className={cx('mt-0.5 text-[11px] uppercase tracking-wide', out ? 'text-white/60' : 'text-[var(--label-3)]')}>{c.linkPreview.site ?? safeHost(c.linkPreview.url)}</div>
           </div>
         </a>
       )}
@@ -220,27 +225,34 @@ function ImageContent({ m }: { m: Message }) {
 function VideoContent({ m }: { m: Message }) {
   const c = m.content as Extract<Message['content'], { kind: 'video' }>
   const [playing, setPlaying] = useState(false)
-  const ar = Math.min(Math.max(c.w / c.h, 0.6), 2.2)
+  const ar = c.w && c.h ? Math.min(Math.max(c.w / c.h, 0.6), 2.2) : 16 / 9
   return (
     <div>
       <div className="relative overflow-hidden rounded-[10px] bg-black" style={{ aspectRatio: ar, maxWidth: 320 }}>
-        {c.poster && <img src={c.poster} alt="" className="absolute inset-0 size-full object-cover" loading="lazy" />}
-        {!playing && (
+        {playing ? (
+          <video
+            src={c.url}
+            controls
+            autoPlay
+            playsInline
+            className="absolute inset-0 size-full object-contain"
+          />
+        ) : (
           <button
             onClick={() => setPlaying(true)}
             className="press absolute inset-0 grid place-items-center"
             aria-label="Play video"
           >
-            <span className="grid size-12 place-items-center rounded-full bg-black/45 text-white backdrop-blur-sm">
+            {c.poster && <img src={c.poster} alt="" className="absolute inset-0 size-full object-cover" loading="lazy" />}
+            <span className="relative grid size-12 place-items-center rounded-full bg-black/45 text-white backdrop-blur-sm">
               <Play size={22} weight="fill" className="translate-x-[1px]" />
             </span>
           </button>
         )}
-        {playing && <div className="absolute inset-0 grid place-items-center text-[12px] text-white/80">Playing…</div>}
         <span className="absolute left-1.5 top-1.5 rounded-[7px] bg-black/55 px-[5px] py-[2px] text-[11px] font-medium tabular-nums text-white">
-          {durationLabel(c.duration)}
+          {durationLabel(c.duration ?? 0)}
         </span>
-        {!c.caption && <MetaOverlay m={m} />}
+        {!playing && !c.caption && <MetaOverlay m={m} />}
       </div>
       {c.caption && <MediaCaption m={m} caption={c.caption} />}
     </div>
@@ -249,18 +261,25 @@ function VideoContent({ m }: { m: Message }) {
 
 function DocContent({ m, out }: { m: Message; out: boolean }) {
   const c = m.content as Extract<Message['content'], { kind: 'document' }>
+  const ext = c.name.includes('.') ? c.name.split('.').pop()!.slice(0, 5).toUpperCase() : 'FILE'
   return (
-    <div className={cx('flex w-[240px] items-center gap-3 rounded-[10px] p-2.5', out ? 'bg-white/[0.14]' : 'bg-black/[0.04] dark:bg-white/[0.06]')}>
-      <span className={cx('grid size-11 shrink-0 place-items-center rounded-[10px]', out ? 'bg-white/20 text-white' : 'bg-[var(--blue)]/12 text-[var(--blue)]')}>
+    <a
+      href={c.url ?? '#'}
+      download={c.name}
+      onClick={(e) => { if (!c.url) e.preventDefault() }}
+      className={cx('press flex w-[250px] items-center gap-3 rounded-[10px] p-2.5 no-underline', out ? 'bg-white/[0.14]' : 'bg-black/[0.04] dark:bg-white/[0.06]')}
+    >
+      <span className={cx('relative grid size-11 shrink-0 place-items-center rounded-[10px]', out ? 'bg-white/20 text-white' : 'bg-[var(--blue)]/12 text-[var(--blue)]')}>
         <FileText size={22} />
+        <span className="absolute bottom-[3px] rounded-[3px] bg-current/0 px-[2px] text-[7px] font-bold tracking-wide" style={{ color: 'inherit' }}>{ext}</span>
       </span>
-      <div className="min-w-0">
-        <div className="truncate text-[14px] font-medium">{c.name}</div>
+      <div className="min-w-0 flex-1">
+        <div className={cx('truncate text-[14px] font-medium', out ? 'text-white' : 'text-[var(--label)]')}>{c.name}</div>
         <div className={cx('text-[12px]', out ? 'text-white/70' : 'text-[var(--label-2)]')}>
-          {fileSize(c.size)}{c.pages ? ` · ${c.pages} pages` : ''}
+          {fileSize(c.size)}{c.pages ? ` · ${c.pages} pages` : ''} · {ext}
         </div>
       </div>
-    </div>
+    </a>
   )
 }
 
@@ -465,8 +484,10 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
         { label: 'Forward…', icon: <Share size={16} />, onClick: () => setForwarding([m]) },
         { label: m.starred ? 'Unstar' : 'Star', icon: <Star size={16} />, onClick: () => doStar(m.chatId, [m.id], !m.starred) },
         { label: 'Edit', icon: <PencilSimple size={16} />, disabled: !out || m.content.kind !== 'text', onClick: () => setEditing(m) },
+        { label: 'Pin in chat', icon: <PushPin size={16} />, onClick: () => doPinMessage(m.chatId, m.id, true) },
         { label: 'Select', icon: <SelectionAll size={16} />, onClick: () => startSelection(id), separatorAbove: true },
         { label: 'Delete', icon: <Trash size={16} />, destructive: true, separatorAbove: true, onClick: () => doDelete(m.chatId, [m.id], false) },
+        { label: 'Delete for everyone', icon: <Trash size={16} />, destructive: true, hidden: !out || isDeleted, onClick: () => doDelete(m.chatId, [m.id], true) },
       ],
       { list: QUICK_REACTIONS, onPick: (e) => doReact(m.chatId, m.id, e) },
     )
@@ -540,7 +561,7 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
           )}
           {m.replyTo && (
             <div className={hasMedia ? 'px-[3px] pt-[3px]' : undefined}>
-              <Quote m={m.replyTo} out={out} />
+              <Quote m={m.replyTo} out={out} chatId={m.chatId} />
             </div>
           )}
 
