@@ -58,6 +58,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   const hasMore = useStore((s) => s.buckets.get(chat.id)?.hasMore ?? false)
   const loaded = useStore((s) => s.buckets.get(chat.id)?.loaded ?? false)
   const flashId = useStore((s) => s.flashId)
+  const reducedMotion = useStore((s) => s.settings.animLevel === 'reduced')
   const scrollRef = useRef<HTMLDivElement>(null)
   const atBottom = useRef(true)
   const loadingOlder = useRef(false)
@@ -138,12 +139,12 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
     if (!flashId) return
     const idx = items.findIndex((it) => it.t === 'msg' && it.id === flashId)
     if (idx >= 0) {
-      virt.scrollToIndex(idx, { align: 'center', behavior: 'smooth' })
+      virt.scrollToIndex(idx, { align: 'center', behavior: reducedMotion ? 'auto' : 'smooth' })
       const t = setTimeout(flashDone, 1700)
       return () => clearTimeout(t)
     }
     flashDone()
-  }, [flashId, items, virt])
+  }, [flashId, items, virt, reducedMotion])
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current
@@ -160,15 +161,20 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   }, [chat.id, hasMore])
 
   const jumpDown = () => {
-    virt.scrollToIndex(items.length - 1, { align: 'end', behavior: 'smooth' })
+    virt.scrollToIndex(items.length - 1, { align: 'end', behavior: reducedMotion ? 'auto' : 'smooth' })
     setPending(0)
   }
 
-  // floating date: the day owning the first visible row — O(1), no walk
-  const firstVis = items[virt.getVirtualItems()[0]?.index ?? 0]
+  // floating date: the day owning the first truly-VISIBLE row — the first
+  // virtual item is overscan above the viewport, so it reports a day the
+  // user hasn't reached yet. And when that row IS a day separator, the
+  // in-flow pill already shows — a floating twin would duplicate it.
+  const visItems = virt.getVirtualItems()
+  const scrollTop = scrollRef.current?.scrollTop ?? 0
+  const firstVisItem = visItems.find((v) => v.end > scrollTop) ?? visItems[0]
+  const firstVis = items[firstVisItem?.index ?? 0]
   const floatLabel =
-    firstVis?.t === 'day' ? firstVis.label
-    : firstVis?.t === 'msg' ? dayLabel(map!.get(firstVis.id)!.ts)
+    firstVis?.t === 'msg' ? dayLabel(map!.get(firstVis.id)!.ts)
     : null
 
   return (
@@ -232,7 +238,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
                 initial={{ opacity: 0, scale: 0.92 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.08 } }}
-                className="menu-material block rounded-full px-3 py-[5px] text-[12px] font-medium text-[var(--label-2)]"
+                className="pill block rounded-full px-3 py-[5px] text-[12px] font-medium text-[var(--label-2)] shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
               >
                 {floatLabel}
               </motion.span>
@@ -250,7 +256,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
             exit={{ opacity: 0, scale: 0.9, y: 8, transition: { duration: 0.1 } }}
             transition={spring.pop}
             onClick={jumpDown}
-            className="menu-material absolute bottom-3 right-4 z-20 flex items-center gap-1.5 rounded-full py-[7px] pl-[9px] pr-[11px] text-[var(--label-2)]"
+            className="pill absolute bottom-3 right-4 z-20 flex items-center gap-1.5 rounded-full py-[7px] pl-[9px] pr-[11px] text-[var(--label-2)] shadow-[0_1px_3px_rgba(0,0,0,0.1)] ring-1 ring-[var(--separator)]"
             aria-label="Jump to latest messages"
           >
             <ArrowDown size={15} weight="bold" />

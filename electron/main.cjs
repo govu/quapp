@@ -37,15 +37,16 @@ function daemonPath() {
 
 const daemonLog = () => path.join(app.getPath('userData'), 'quappd-spawn.log')
 // per-launch token the daemon writes to <data>/token.txt; the renderer needs
-// it to connect — read with a small retry since the daemon writes on boot
-function daemonToken() {
-  for (let i = 0; i < 40; i++) {
+// it to connect — read async with a retry (a busy-spin would freeze the main
+// process and delay first paint by seconds on cold starts)
+async function daemonToken() {
+  const p = path.join(app.getPath('userData'), 'quappd', 'token.txt')
+  for (let i = 0; i < 60; i++) {
     try {
-      const t = fs.readFileSync(path.join(app.getPath('userData'), 'quappd', 'token.txt'), 'utf8').trim()
+      const t = (await fs.promises.readFile(p, 'utf8')).trim()
       if (t) return t
     } catch { /* not written yet */ }
-    const end = Date.now() + 250
-    while (Date.now() < end) { /* spin — boot-time, sub-second */ }
+    await new Promise((r) => setTimeout(r, 250))
   }
   return ''
 }
@@ -67,6 +68,9 @@ function startDaemon() {
         QUAPP_MEDIA_PORT: '8766',
         QUAPP_DATA: path.join(app.getPath('userData'), 'quappd'),
         QUAPPD_DEV: isDev ? '1' : '0',
+        // the daemon polls this and self-exits if the app dies — prevents
+        // orphaned daemons keeping the WhatsApp session online after a crash
+        QUAPP_PARENT_PID: String(process.pid),
       },
       silent: true,
     })
@@ -119,27 +123,39 @@ function createWindow() {
     if (/^https?:/.test(url) && !url.startsWith('http://127.0.0.1:8766')) shell.openExternal(url)
     return { action: 'deny' }
   })
+  // navigation is allowed only to the app's own entry point (and the dev
+  // server); this also blocks drop-a-file-to-navigate, which the in-app
+  // drag-drop attachment flow already handles
+  const indexUrl = require('node:url').pathToFileURL(path.join(__dirname, '..', 'dist', 'index.html')).href
   win.webContents.on('will-navigate', (e, url) => {
-    if (!url.startsWith('file://') && url !== DEV_URL && !url.startsWith('http://127.0.0.1:8766')) {
+    if (!url.startsWith(indexUrl) && url !== DEV_URL && !url.startsWith('http://127.0.0.1:8766')) {
       e.preventDefault()
-      shell.openExternal(url)
+      if (/^https?:/.test(url)) shell.openExternal(url)
     }
+  })
+  win.webContents.on('render-process-gone', (_e, d) => {
+    dlog(`renderer gone reason=${d.reason}`)
+    if (d.reason !== 'clean-exit' && !win.isDestroyed()) win.reload()
   })
 
   // ⌘K / ⌘F etc. reach the page; keep standard editing accelerators
   Menu.setApplicationMenu(null)
 
-  if (isDev) win.loadURL(DEV_URL)
-  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
-    query: {
-      token: daemonToken(),
-      // let the renderer relax its sidebar material when real Mica is behind it
-      mica: win.getBackgroundMaterial?.() === 'mica' ? '1' : '0',
-    },
-  })
+  if (isDev) void win.loadURL(DEV_URL)
+  else void daemonToken().then((token) =>
+    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
+      query: {
+        token,
+        // let the renderer relax its sidebar material when real Mica is behind it
+        mica: win.getBackgroundMaterial?.() === 'mica' ? '1' : '0',
+      },
+    }),
+  )
 }
 
 app.whenReady().then(() => {
+  // fixes taskbar pinning/jumplists + notification attribution — matches appId
+  app.setAppUserModelId('com.quapp.app')
   startDaemon()
   createWindow()
   app.on('activate', () => {

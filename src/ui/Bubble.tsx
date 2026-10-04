@@ -3,23 +3,28 @@ import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   ArrowBendUpLeft, ArrowClockwise, ArrowCounterClockwise,
-  Check, Checks, Clock, Copy, DotsThree, FileText, Image as ImageIcon, PushPin, Share, MapPin,
+  Check, Checks, Clock, Copy, DotsThree, DownloadSimple, FileText, Image as ImageIcon, PushPin, Share, MapPin,
   PencilSimple, Play, SelectionAll, Smiley, Star, Trash, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
 import { cx, durationLabel, fileSize, isEmojiOnly, renderMarkup, spring, timeLabel } from '../lib/util'
 import {
-  doDelete, doPinMessage, doReact, doStar, doVote, jumpTo, setEditing, setForwarding, setReplyTo, startSelection, toggleSelect, useStore,
+  doDelete, doDownload, doPinMessage, doReact, doStar, doVote, jumpTo, setEditing, setForwarding, setReplyTo, startSelection, toggleSelect, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { showContextMenu } from './Menu'
 import { WaveformPlayer } from './Voice'
 
-const SENDER_COLORS = ['#0a84ff', '#30d158', '#ff9f0a', '#ff375f', '#bf5af2', '#64d2ff', '#ffd60a', '#ff6482']
+// two palettes: the same hue slot stays stable per sender, but light theme
+// needs ~4.5:1 on the pale incoming bubble where #ffd60a/#64d2ff wash out
+const SENDER_COLORS_LIGHT = ['#0066cc', '#1e9c46', '#b06c00', '#d21f46', '#8f3fd0', '#0088aa', '#8a7a00', '#d44d66']
+const SENDER_COLORS_DARK = ['#0a84ff', '#30d158', '#ff9f0a', '#ff375f', '#bf5af2', '#64d2ff', '#ffd60a', '#ff6482']
 export const senderColor = (id: string) => {
   let h = 0
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
-  return SENDER_COLORS[h % SENDER_COLORS.length]
+  const i = h % SENDER_COLORS_LIGHT.length
+  const dark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+  return (dark ? SENDER_COLORS_DARK : SENDER_COLORS_LIGHT)[i]
 }
 
 // iMessage tail paths (viewBox 0 0 22 20)
@@ -51,10 +56,25 @@ function Ticks({ m }: { m: Message }) {
   return null
 }
 
+const META_W = (m: Message) => 46 + (m.from === 'me' && m.delivery ? 28 : 0) + (m.edited || m.starred ? 22 : 0)
+
 /** inline meta: floats right inside the last line of text/caption */
 function Meta({ m, out }: { m: Message; out: boolean }) {
   return (
     <span className={cx('float-right mb-[-2px] ml-2 mt-[8px] inline-flex translate-y-[2px] items-center whitespace-nowrap text-[11px] tabular-nums', out ? 'text-[var(--bubble-meta-out)]' : 'text-[var(--bubble-meta-in)]')}>
+      {m.edited && <span className="mr-1 italic">edited</span>}
+      {m.starred && <Star size={10} weight="fill" className="mr-[3px]" />}
+      {timeLabel(m.ts)}
+      <Ticks m={m} />
+    </span>
+  )
+}
+
+/** meta pinned to the bubble's bottom-right — for text bubbles the trailing
+ *  spacer reserves its room on the last line; block contents get it overlaid */
+function MetaAbs({ m, out }: { m: Message; out: boolean }) {
+  return (
+    <span className={cx('pointer-events-none absolute bottom-[4px] right-[9px] inline-flex items-center whitespace-nowrap text-[11px] tabular-nums', out ? 'text-[var(--bubble-meta-out)]' : 'text-[var(--bubble-meta-in)]')}>
       {m.edited && <span className="mr-1 italic">edited</span>}
       {m.starred && <Star size={10} weight="fill" className="mr-[3px]" />}
       {timeLabel(m.ts)}
@@ -118,6 +138,7 @@ function Reactions({ m, out }: { m: Message; out: boolean }) {
 
 // ---------- lightbox ----------
 function Lightbox({ url, caption, onClose }: { url: string; caption?: string; onClose: () => void }) {
+  const [fail, setFail] = useState(false)
   useEffect(() => {
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', k)
@@ -132,16 +153,25 @@ function Lightbox({ url, caption, onClose }: { url: string; caption?: string; on
       className="fixed inset-0 z-[95] grid place-items-center bg-black/70 backdrop-blur-md"
       onClick={onClose}
     >
-      <motion.img
-        src={url}
-        alt={caption ?? ''}
-        initial={{ scale: 0.92, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.96, opacity: 0 }}
-        transition={spring.pop}
-        className="max-h-[86vh] max-w-[88vw] rounded-[10px] object-contain shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      />
+      {fail ? (
+        <div className="grid place-items-center gap-3 text-center text-white/70" onClick={(e) => e.stopPropagation()}>
+          <ImageIcon size={40} className="text-white/40" />
+          <p className="text-[14px]">Media unavailable</p>
+          <p className="text-[12px] text-white/50">Open WhatsApp on your phone to restore it</p>
+        </div>
+      ) : (
+        <motion.img
+          src={url}
+          alt={caption ?? ''}
+          initial={{ scale: 0.92, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.96, opacity: 0 }}
+          transition={spring.pop}
+          onError={() => setFail(true)}
+          className="max-h-[86vh] max-w-[88vw] rounded-[10px] object-contain shadow-2xl"
+          onClick={(e) => e.stopPropagation()}
+        />
+      )}
       {caption && (
         <div className="pointer-events-none absolute bottom-8 left-1/2 max-w-[70vw] -translate-x-1/2 rounded-full bg-black/50 px-4 py-1.5 text-center text-[13.5px] text-white/90 backdrop-blur-sm">
           {caption}
@@ -253,16 +283,26 @@ function ImageContent({ m }: { m: Message }) {
 function VideoContent({ m }: { m: Message }) {
   const c = m.content as Extract<Message['content'], { kind: 'video' }>
   const [playing, setPlaying] = useState(false)
+  const [fail, setFail] = useState(false)
   const ar = c.w && c.h ? Math.min(Math.max(c.w / c.h, 0.6), 2.2) : 16 / 9
   return (
     <div>
       <div className="relative overflow-hidden rounded-[10px] bg-black" style={{ aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320 }}>
-        {playing ? (
+        {fail ? (
+          <span className="absolute inset-0 grid place-items-center p-4 text-center">
+            <span>
+              <ImageIcon size={26} className="mx-auto text-white/50" />
+              <span className="mt-2 block text-[12px] font-medium text-white/70">Media unavailable</span>
+              <span className="mt-0.5 block text-[11px] text-white/50">Open WhatsApp on your phone to restore it</span>
+            </span>
+          </span>
+        ) : playing ? (
           <video
             src={c.url}
             controls
             autoPlay
             playsInline
+            onError={() => setFail(true)}
             className="absolute inset-0 size-full object-contain"
           />
         ) : (
@@ -290,12 +330,12 @@ function VideoContent({ m }: { m: Message }) {
 function DocContent({ m, out }: { m: Message; out: boolean }) {
   const c = m.content as Extract<Message['content'], { kind: 'document' }>
   const ext = c.name.includes('.') ? c.name.split('.').pop()!.slice(0, 5).toUpperCase() : 'FILE'
+  const [busy, setBusy] = useState(false)
   return (
-    <a
-      href={c.url ?? '#'}
-      download={c.name}
-      onClick={(e) => { if (!c.url) e.preventDefault() }}
-      className={cx('press flex w-[250px] items-center gap-3 rounded-[10px] p-2.5 no-underline', out ? 'bg-white/[0.14]' : 'bg-black/[0.04] dark:bg-white/[0.06]')}
+    <button
+      onClick={() => { setBusy(true); void doDownload(m).finally(() => setBusy(false)) }}
+      title="Save to Downloads"
+      className={cx('press flex w-[250px] items-center gap-3 rounded-[10px] p-2.5 text-left', out ? 'bg-white/[0.14]' : 'bg-black/[0.04] dark:bg-white/[0.06]', busy && 'opacity-60')}
     >
       <span className={cx('relative grid size-11 shrink-0 place-items-center rounded-[10px]', out ? 'bg-white/20 text-white' : 'bg-[var(--blue)]/12 text-[var(--blue)]')}>
         <FileText size={22} />
@@ -307,7 +347,8 @@ function DocContent({ m, out }: { m: Message; out: boolean }) {
           {fileSize(c.size)}{c.pages ? ` · ${c.pages} pages` : ''} · {ext}
         </div>
       </div>
-    </a>
+      <DownloadSimple size={18} className={cx('shrink-0', out ? 'text-white/70' : 'text-[var(--label-3)]')} />
+    </button>
   )
 }
 
@@ -349,11 +390,11 @@ function PollContent({ m, out }: { m: Message; out: boolean }) {
                 />
               )}
               <span className="relative flex items-center justify-between gap-2">
-                <span className="flex items-center gap-2">
-                  <span className={cx('grid size-[18px] place-items-center rounded-full border-[1.5px]', mine ? 'border-[var(--blue)] bg-[var(--blue)]' : out ? 'border-white/50' : 'border-[var(--label-3)]')}>
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className={cx('grid size-[18px] shrink-0 place-items-center rounded-full border-[1.5px]', mine ? 'border-[var(--blue)] bg-[var(--blue)]' : out ? 'border-white/50' : 'border-[var(--label-3)]')}>
                     {mine && <Check size={11} weight="bold" className="text-white" />}
                   </span>
-                  {o.text}
+                  <span className="min-w-0 truncate">{o.text}</span>
                 </span>
                 {voted && <span className={cx('text-[12px] tabular-nums', out ? 'text-white/70' : 'text-[var(--label-2)]')}>{pct}%</span>}
               </span>
@@ -438,6 +479,7 @@ export interface RowCtx {
 function QuickActions({ m, out, chat, onMenu }: { m: Message; out: boolean; chat: Chat; onMenu: (e: React.MouseEvent) => void }) {
   const [reactOpen, setReactOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const [reactDir, setReactDir] = useState<'up' | 'down'>('up')
 
   useEffect(() => {
     if (!reactOpen) return
@@ -452,8 +494,8 @@ function QuickActions({ m, out, chat, onMenu }: { m: Message; out: boolean; chat
     <div
       ref={wrapRef}
       className={cx(
-        'relative mb-[3px] flex shrink-0 items-center gap-[2px] self-end rounded-full p-[2px] opacity-0 transition-opacity duration-100',
-        'bg-[var(--bg)] shadow-[0_1px_4px_rgba(0,0,0,0.08),0_0_0_0.5px_var(--separator)] group-hover:opacity-100',
+        'pointer-events-none relative mb-[3px] flex shrink-0 items-center gap-[2px] self-end rounded-full p-[2px] opacity-0 transition-opacity duration-100',
+        'bg-[var(--bg)] shadow-[0_1px_4px_rgba(0,0,0,0.08),0_0_0_0.5px_var(--separator)] group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
       )}
     >
       <QaBtn
@@ -462,7 +504,11 @@ function QuickActions({ m, out, chat, onMenu }: { m: Message; out: boolean; chat
       >
         <ArrowBendUpLeft size={15} />
       </QaBtn>
-      <QaBtn label="React" onClick={() => setReactOpen((v) => !v)} active={reactOpen}>
+      <QaBtn label="React" onClick={() => {
+        // rows near the scroller's top get clipped if the tray opens upward
+        setReactDir((wrapRef.current?.getBoundingClientRect().top ?? 200) < 140 ? 'down' : 'up')
+        setReactOpen((v) => !v)
+      }} active={reactOpen}>
         <Smiley size={15} />
       </QaBtn>
       <QaBtn label="More" onClick={onMenu}>
@@ -476,7 +522,7 @@ function QuickActions({ m, out, chat, onMenu }: { m: Message; out: boolean; chat
             exit={{ opacity: 0, scale: 0.9, y: 4, transition: { duration: 0.08 } }}
             transition={spring.pop}
             style={{ transformOrigin: out ? 'bottom right' : 'bottom left' }}
-            className={cx('menu-material absolute bottom-[calc(100%+6px)] z-50 flex items-center gap-[1px] rounded-full p-1', out ? 'right-0' : 'left-0')}
+            className={cx('menu-material absolute z-50 flex items-center gap-[1px] rounded-full p-1', reactDir === 'up' ? 'bottom-[calc(100%+6px)]' : 'top-[calc(100%+6px)]', out ? 'right-0' : 'left-0')}
           >
             {QUICK_REACTIONS.map((e) => (
               <button
@@ -517,6 +563,7 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
   const isSystem = m.content.kind === 'system'
   const hasMedia = m.content.kind === 'image' || m.content.kind === 'video' || m.content.kind === 'sticker'
   const isDeleted = m.content.kind === 'deleted'
+  const downloadable = ['image', 'video', 'document', 'audio', 'sticker'].includes(m.content.kind)
   const caption = m.content.kind === 'image' || m.content.kind === 'video' ? m.content.caption : undefined
 
   const menu = (e: React.MouseEvent) => {
@@ -527,10 +574,11 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
       [
         { label: 'Reply', icon: <ArrowBendUpLeft size={16} />, onClick: () => setReplyTo({ id: m.id, from: m.from, fromName: out ? 'You' : m.fromName ?? ctx.chat.title, preview: previewOf(m), kind: m.content.kind }) },
         { label: 'Copy', icon: <Copy size={16} />, disabled: !copyable, onClick: () => { if (m.content.kind === 'text') navigator.clipboard.writeText(m.content.text) } },
-        { label: 'Forward…', icon: <Share size={16} />, onClick: () => setForwarding([m]) },
-        { label: m.starred ? 'Unstar' : 'Star', icon: <Star size={16} />, onClick: () => doStar(m.chatId, [m.id], !m.starred) },
+        { label: 'Forward…', icon: <Share size={16} />, hidden: isDeleted, onClick: () => setForwarding([m]) },
+        { label: m.starred ? 'Unstar' : 'Star', icon: <Star size={16} />, hidden: isDeleted, onClick: () => doStar(m.chatId, [m.id], !m.starred) },
         { label: 'Edit', icon: <PencilSimple size={16} />, disabled: !out || m.content.kind !== 'text', onClick: () => setEditing(m) },
-        { label: 'Pin in chat', icon: <PushPin size={16} />, onClick: () => doPinMessage(m.chatId, m.id, true) },
+        { label: 'Pin in chat', icon: <PushPin size={16} />, hidden: isDeleted, onClick: () => doPinMessage(m.chatId, m.id, true) },
+        { label: 'Save to Downloads', icon: <DownloadSimple size={16} />, hidden: !downloadable || isDeleted, onClick: () => void doDownload(m) },
         { label: 'Select', icon: <SelectionAll size={16} />, onClick: () => startSelection(id), separatorAbove: true },
         { label: 'Delete', icon: <Trash size={16} />, destructive: true, separatorAbove: true, onClick: () => doDelete(m.chatId, [m.id], false) },
         { label: 'Delete for everyone', icon: <Trash size={16} />, destructive: true, hidden: !out || isDeleted, onClick: () => doDelete(m.chatId, [m.id], true) },
@@ -557,7 +605,9 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
         'group relative flex w-full items-end gap-[6px] px-3',
         out ? 'justify-end' : 'justify-start',
         ctx.last ? 'mb-[7px]' : 'mb-[2px]',
-        m.reactions?.length && ctx.last ? 'mb-[19px]' : '',
+        // reaction chips hang 12px below the row — they overlap the next
+        // bubble no matter where in the group this row sits
+        m.reactions?.length ? 'mb-[19px]' : '',
         selected && 'bg-[var(--blue)]/8',
         flashing && 'msg-flash',
       )}
@@ -599,7 +649,7 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
           {ctx.last && !isDeleted && <Tail out={out} />}
 
           {!out && ctx.first && ctx.chat.kind === 'group' && (
-            <div className={cx('text-[13px] font-semibold', hasMedia ? 'px-2 pt-1' : 'mb-0.5')} style={{ color: senderColor(m.from) }}>
+            <div className={cx('min-w-0 truncate text-[13px] font-semibold', hasMedia ? 'px-2 pt-1' : 'mb-0.5')} style={{ color: senderColor(m.from) }}>
               {m.fromName}
             </div>
           )}
@@ -614,12 +664,33 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
             </div>
           )}
 
-          <div className={cx((hasMedia && m.content.kind !== 'sticker') || caption ? 'relative' : '')}>
-            <Content m={m} out={out} />
-          </div>
-
-          {/* inline meta only for pure text-like bubbles; media handles its own */}
-          {!hasMedia && m.content.kind !== 'sticker' && <Meta m={m} out={out} />}
+          {hasMedia || m.content.kind === 'sticker' ? (
+            <div className={cx((hasMedia && m.content.kind !== 'sticker') || caption ? 'relative' : '')}>
+              <Content m={m} out={out} />
+            </div>
+          ) : m.content.kind === 'text' ? (
+            // meta tucked into the last text line: absolute positioning + an
+            // invisible trailing spacer reserves its room — a block-sibling
+            // float can never ride up into the text (was: meta on its own line)
+            <>
+              <Content m={m} out={out} />
+              <span className="inline-block h-[13px] align-bottom" style={{ width: META_W(m) }} aria-hidden />
+              <MetaAbs m={m} out={out} />
+            </>
+          ) : m.content.kind === 'poll' ? (
+            // poll options own the full row width — a corner overlay would sit
+            // on the last option's % readout; a footer row is honest
+            <>
+              <Content m={m} out={out} />
+              <div className="mt-0.5 flex justify-end"><Meta m={m} out={out} /></div>
+            </>
+          ) : (
+            // block contents (audio/doc/location): meta overlays the corner
+            <>
+              <Content m={m} out={out} />
+              <MetaAbs m={m} out={out} />
+            </>
+          )}
         </div>
         <Reactions m={m} out={out} />
       </div>

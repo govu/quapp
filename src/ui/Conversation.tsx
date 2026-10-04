@@ -5,14 +5,14 @@ import {
   Share, Trash, User, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat } from '../bridge/types'
-import { cx, spring } from '../lib/util'
+import { cx, listTime, sameDay, spring, timeLabel } from '../lib/util'
 import {
-  clearSelection, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, toast, useStore,
+  clearSelection, confirmClearChat, confirmDeleteChat, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, toast, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { MessageList } from './MessageList'
 import { Composer } from './Composer'
-import { SearchPane, InfoPane } from './Panes'
+import { SearchPane, InfoPane, StarredPane } from './Panes'
 import { showContextMenu } from './Menu'
 
 export function Conversation() {
@@ -29,7 +29,12 @@ export function Conversation() {
   const [drag, setDrag] = useState(0)
 
   if (!chat || !activeChat) {
-    return <EmptyState />
+    return (
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        <EmptyState />
+        <AnimatePresence>{pane === 'starred' && <StarredPane key="st" />}</AnimatePresence>
+      </div>
+    )
   }
 
   return (
@@ -56,6 +61,7 @@ export function Conversation() {
       <AnimatePresence>
         {pane === 'search' && <SearchPane key="sp" chat={chat} />}
         {pane === 'info' && <InfoPane key="ip" chat={chat} />}
+        {pane === 'starred' && <StarredPane key="st" />}
       </AnimatePresence>
 
       {/* drop target — WhatsApp Web style */}
@@ -99,10 +105,15 @@ function Header({ chat }: { chat: Chat }) {
     showContextMenu(e, [
       { label: 'Chat info', icon: <User size={16} />, onClick: () => setPane('info') },
       { label: 'Search in chat', icon: <MagnifyingGlass size={16} />, onClick: () => setPane('search') },
-      { label: chat.muted ? 'Unmute' : 'Mute', icon: <BellSlash size={16} />, onClick: () => doFlag(chat.id, 'muted', !chat.muted), separatorAbove: true },
+      { label: 'Unmute', icon: <BellSlash size={16} />, onClick: () => doFlag(chat.id, 'muted', false), separatorAbove: true, hidden: !chat.muted },
+      { label: 'Mute · 8 hours', icon: <BellSlash size={16} />, onClick: () => doFlag(chat.id, 'muted', true, 8 * 3600e3), separatorAbove: true, hidden: chat.muted },
+      { label: 'Mute · 1 week', icon: <BellSlash size={16} />, onClick: () => doFlag(chat.id, 'muted', true, 7 * 86400e3), hidden: chat.muted },
+      { label: 'Mute always', icon: <BellSlash size={16} />, onClick: () => doFlag(chat.id, 'muted', true), hidden: chat.muted },
       { label: chat.pinned ? 'Unpin' : 'Pin', icon: <PushPin size={16} />, onClick: () => doFlag(chat.id, 'pinned', !chat.pinned) },
       { label: 'Mark as unread', icon: <Checks size={16} />, onClick: () => doMarkUnread(chat.id, true) },
       { label: 'Archive', icon: <Archive size={16} />, onClick: () => doFlag(chat.id, 'archived', true), separatorAbove: true },
+      { label: 'Clear chat', icon: <Trash size={16} />, onClick: () => confirmClearChat(chat.id), separatorAbove: true, hidden: chat.kind === 'saved' },
+      { label: 'Delete chat', icon: <Trash size={16} />, destructive: true, onClick: () => confirmDeleteChat(chat.id), hidden: chat.kind === 'saved' },
     ])
   }
 
@@ -116,7 +127,9 @@ function Header({ chat }: { chat: Chat }) {
           ? 'Channel'
           : chat.kind === 'saved'
             ? 'Message yourself'
-            : 'last seen recently'
+            : chat.lastSeen
+              ? `last seen ${sameDay(chat.lastSeen, Date.now()) ? timeLabel(chat.lastSeen) : listTime(chat.lastSeen)}`
+              : ''
 
   return (
     <div className="chrome hairline-b caption-inset drag z-20 flex h-[56px] shrink-0 items-center gap-3 px-4">

@@ -41,7 +41,9 @@ export function ContextMenuHost() {
       setMenu(m)
       const w = 240, h = (m.reactions ? 52 : 0) + m.items.filter((i) => !i.hidden).length * 34 + m.items.filter((i) => i.separatorAbove && !i.hidden).length * 9 + 16
       const x = Math.min(m.x, window.innerWidth - w - 8)
-      const y = Math.min(m.y, window.innerHeight - h - 8)
+      // clamp below the native title-bar caption buttons (~40px) — a menu
+      // under them eats clicks meant for min/max/close
+      const y = Math.min(Math.max(m.y, 44), window.innerHeight - h - 8)
       setPos({ x, y, ox: m.x - x, oy: m.y - y })
     }
     return () => { openMenu = null }

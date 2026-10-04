@@ -1,9 +1,8 @@
-import { Suspense, lazy, useEffect, useMemo } from 'react'
+import { Suspense, lazy, useEffect, useState } from 'react'
 import { AnimatePresence, MotionConfig } from 'motion/react'
-import { DemoAdapter } from './bridge/demo'
 import { WsAdapter } from './bridge/ws'
 import type { ClientAdapter } from './bridge/types'
-import { boot, clearSelection, logout, nextChat, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
+import { boot, clearSelection, closeConfirm, logout, nextChat, setForwarding, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
 import { Sidebar } from './ui/Sidebar'
 import { Conversation } from './ui/Conversation'
 import { Onboarding } from './ui/Onboarding'
@@ -22,14 +21,29 @@ function withToken(url: string, q: URLSearchParams): string {
   return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token)
 }
 
-function makeAdapter(): ClientAdapter {
+async function makeAdapter(): Promise<ClientAdapter> {
   const q = new URLSearchParams(location.search)
   const url = q.get('bridge')
   if (url) return new WsAdapter(withToken(url, q))
-  if (q.has('demo')) return new DemoAdapter()
+  // demo mode stays out of the production bundle — pulled in only when asked
+  const demo = () => import('./bridge/demo').then((m) => new m.DemoAdapter())
+  if (q.has('demo')) return demo()
   // inside the packaged app the quappd daemon runs as a child process
   if (navigator.userAgent.includes('Electron')) return new WsAdapter(withToken('ws://127.0.0.1:8765', q))
-  return new DemoAdapter()
+  return demo()
+}
+
+function ConfirmHost() {
+  const confirm = useStore((s) => s.confirm)
+  return (
+    <Dialog open={!!confirm} onClose={closeConfirm} title={confirm?.title ?? ''}
+      actions={<>
+        <DialogButton destructive onClick={() => { const r = confirm?.run; closeConfirm(); r?.() }}>{confirm?.ok ?? 'Confirm'}</DialogButton>
+        <DialogButton onClick={closeConfirm}>Cancel</DialogButton>
+      </>}>
+      {confirm?.body}
+    </Dialog>
+  )
 }
 
 function RelinkPrompt() {
@@ -84,12 +98,14 @@ export default function App() {
     }
   }, [])
 
-  const adapter = useMemo(makeAdapter, [])
+  const [adapter, setAdapter] = useState<ClientAdapter | null>(null)
 
   // kick the link/connect immediately — the onboarding screen shows the QR while connecting
   useEffect(() => {
-    void boot(adapter)
-  }, [adapter])
+    let live = true
+    void makeAdapter().then((a) => { if (live) { setAdapter(a); void boot(a) } })
+    return () => { live = false }
+  }, [])
 
   // keyboard shortcuts
   useEffect(() => {
@@ -112,6 +128,8 @@ export default function App() {
       if (e.key === 'Escape') {
         const s = useStore.getState()
         if (s.paletteOpen) { setPalette(false); return }
+        if (s.confirm) { closeConfirm(); return }
+        if (s.forwarding) { setForwarding(null); return }
         if (s.selection) clearSelection()
         else if (s.pane) setPane(null)
         else if (s.settingsOpen) setSettingsOpen(false)
@@ -146,6 +164,7 @@ export default function App() {
         <Toasts />
         <ContextMenuHost />
         <RelinkPrompt />
+        <ConfirmHost />
       </div>
     </MotionConfig>
   )

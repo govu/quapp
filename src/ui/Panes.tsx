@@ -1,15 +1,22 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { motion } from 'motion/react'
 import {
-  Archive, Bell, BellSlash, CaretDown, CaretUp, MagnifyingGlass, Phone, PushPin, Star, Trash, VideoCamera, X,
+  Archive, Bell, BellSlash, CaretDown, CaretUp, MagnifyingGlass, Phone, Prohibit, PushPin, Star, Trash, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doFlag, doForward, doLeaveGroup, jumpTo, requestProfile, searchInChat, setPane, toast, useStore,
+  doDownload, doFlag, doForward, doLeaveGroup, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setPane, toast, useStore,
 } from '../store'
 import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
+
+function BigPhoto({ src }: { src: string }) {
+  const [fail, setFail] = useState(false)
+  if (fail) return <div className="text-white/60">Photo unavailable</div>
+  return <img src={src} alt="" onError={() => setFail(true)} className="max-h-[80vh] max-w-[80vw] rounded-2xl shadow-2xl" />
+}
 
 function PaneShell({ children, title, onClose }: { children: React.ReactNode; title: string; onClose: () => void }) {
   return (
@@ -180,10 +187,19 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
   const contact = chat.contactId ? contacts.get(chat.contactId) : undefined
   const profile = useStore((s) => s.profiles.get(chat.id))
   const [bigPhoto, setBigPhoto] = useState(false)
+  const [subject, setSubject] = useState(chat.title)
+  const [blocked, setBlocked] = useState<boolean | null>(null)
   // pull the live profile (about/business) + warm the hi-res pic — dm/saved only
   const isDm = chat.kind === 'dm' || chat.kind === 'saved'
   useEffect(() => {
     if (isDm && chat.id.includes('@')) requestProfile(chat.id)
+  }, [chat.id, isDm])
+  // blocklist state for the Block row — fetched lazily, not a hot path
+  useEffect(() => {
+    if (!isDm || chat.id === 'saved') return
+    void useStore.getState().adapter?.blocklist?.().then((jids) => {
+      setBlocked(jids.some((j) => j === chat.id || chat.id.startsWith(j.split('@')[0] + '@')))
+    }).catch(() => setBlocked(false))
   }, [chat.id, isDm])
   const phone = contact?.phone ?? (isDm && chat.id.endsWith('@s.whatsapp.net') ? '+' + chat.id.split('@')[0] : undefined)
   const about = profile?.about ?? contact?.about
@@ -200,13 +216,14 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
           >
             <Avatar name={chat.title} hue={chat.avatarHue} url={bigUrl} size={96} />
           </button>
-          {bigPhoto && bigUrl && (
+          {bigPhoto && bigUrl && createPortal(
             <div
-              className="fixed inset-0 z-50 grid place-items-center bg-black/70 backdrop-blur-sm"
+              className="fixed inset-0 z-[95] grid place-items-center bg-black/70 backdrop-blur-sm"
               onClick={() => setBigPhoto(false)}
             >
-              <img src={bigUrl} alt="" className="max-h-[80vh] max-w-[80vw] rounded-2xl shadow-2xl" />
-            </div>
+              <BigPhoto src={bigUrl} />
+            </div>,
+            document.body,
           )}
           <div className="mt-3 text-[19px] font-semibold">{chat.kind === 'saved' ? 'You' : chat.title}</div>
           <div className="mt-0.5 text-[13.5px] text-[var(--label-2)]">
@@ -278,12 +295,10 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
               {docs.map((m) => {
                 const d = m.content as Extract<Message['content'], { kind: 'document' }>
                 return (
-                  <a
+                  <button
                     key={m.id}
-                    href={d.url ?? '#'}
-                    download={d.name}
-                    onClick={(e) => { if (!d.url) e.preventDefault() }}
-                    className="press flex w-full items-center gap-3 rounded-[9px] px-2 py-2 text-left no-underline hover:bg-[var(--fill-3)]"
+                    onClick={() => void doDownload(m)}
+                    className="press flex w-full items-center gap-3 rounded-[9px] px-2 py-2 text-left hover:bg-[var(--fill-3)]"
                   >
                     <span className="grid size-8 shrink-0 place-items-center rounded-[8px] bg-[var(--blue)]/12 text-[var(--blue)]">
                       <Archive size={15} />
@@ -292,7 +307,7 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
                       <span className="block truncate text-[13.5px] font-medium text-[var(--label)]">{d.name}</span>
                       <span className="block text-[12px] text-[var(--label-3)]">{timeLabel(m.ts)}</span>
                     </span>
-                  </a>
+                  </button>
                 )
               })}
             </div>
@@ -312,6 +327,27 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
                   <span className="line-clamp-2 text-[13.5px] leading-[17px]">{previewOf(m)}</span>
                 </button>
               ))}
+            </div>
+          </Section>
+        )}
+
+        {chat.kind === 'group' && chat.youAdmin && (
+          <Section title="Group name">
+            <div className="px-4 pb-2">
+              <input
+                value={subject}
+                onChange={(e) => setSubject(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && subject.trim() && subject !== chat.title) {
+                    void useStore.getState().adapter?.groupEdit?.(chat.id, { subject: subject.trim() })
+                  }
+                }}
+                onBlur={() => {
+                  if (subject.trim() && subject !== chat.title) void useStore.getState().adapter?.groupEdit?.(chat.id, { subject: subject.trim() })
+                }}
+                aria-label="Group name"
+                className="w-full rounded-[9px] bg-[var(--fill-3)] px-3 py-2 text-[14px] outline-none focus:ring-2 focus:ring-[var(--blue)]/50"
+              />
             </div>
           </Section>
         )}
@@ -354,16 +390,30 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
               onClick={() => doFlag(chat.id, 'favorite', !chat.favorite)}
             />
             <InfoRow icon={<Archive size={17} />} label="Archive chat" onClick={() => doFlag(chat.id, 'archived', true)} />
+            {isDm && chat.id !== 'saved' && blocked !== null && (
+              <InfoRow
+                icon={<Prohibit size={17} />}
+                label={blocked ? `Unblock ${chat.title}` : `Block ${chat.title}`}
+                destructive={!blocked}
+                onClick={() => {
+                  void useStore.getState().adapter?.block?.(chat.id, !blocked)
+                  setBlocked(!blocked)
+                }}
+              />
+            )}
             {chat.kind === 'group' && (
               <InfoRow icon={<Trash size={17} />} label="Leave group" destructive onClick={() => setLeaveConfirm(true)} />
             )}
-            <Dialog open={leaveConfirm} onClose={() => setLeaveConfirm(false)} title={`Leave "${chat.title}"?`}
-              actions={<>
-                <DialogButton destructive onClick={() => { setLeaveConfirm(false); void doLeaveGroup(chat.id) }}>Leave</DialogButton>
-                <DialogButton onClick={() => setLeaveConfirm(false)}>Cancel</DialogButton>
-              </>}>
-              You'll be removed from the group and won't be able to send or receive its messages here.
-            </Dialog>
+            {createPortal(
+              <Dialog open={leaveConfirm} onClose={() => setLeaveConfirm(false)} title={`Leave "${chat.title}"?`}
+                actions={<>
+                  <DialogButton destructive onClick={() => { setLeaveConfirm(false); void doLeaveGroup(chat.id) }}>Leave</DialogButton>
+                  <DialogButton onClick={() => setLeaveConfirm(false)}>Cancel</DialogButton>
+                </>}>
+                You'll be removed from the group and won't be able to send or receive its messages here.
+              </Dialog>,
+              document.body,
+            )}
           </div>
         </Section>
       </div>
@@ -388,6 +438,55 @@ function RoundAction({ icon, label, onClick }: { icon: React.ReactNode; label: s
     </button>
   )
 }
+
+// ---------- starred messages across all chats ----------
+export const StarredPane = memo(function StarredPane() {
+  const list = useStore((s) => s.starredList)
+  const chats = useStore((s) => s.chats)
+  useEffect(() => { void loadStarred() }, [])
+  const starred = list && list !== 'loading' ? list : []
+  return (
+    <PaneShell title="Starred" onClose={() => setPane(null)}>
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
+        {list === 'loading' && <div className="grid h-24 place-items-center text-[13px] text-[var(--label-3)]">Loading…</div>}
+        {list !== 'loading' && starred.length === 0 && (
+          <div className="grid h-40 place-items-center px-6 text-center text-[13.5px] leading-relaxed text-[var(--label-3)]">
+            Star messages and they'll appear here — tap and hold a message, or use the ⋯ menu.
+          </div>
+        )}
+        {starred.map((m) => {
+          const c = chats.get(m.chatId)
+          return (
+            <div key={m.id} className="group relative">
+              <button
+                onClick={() => { setPane(null); void jumpTo(m.chatId, m.id) }}
+                className="press flex w-full items-center gap-3 rounded-[10px] px-2 py-2.5 text-left hover:bg-[var(--fill-3)]"
+              >
+                <Avatar name={c?.title ?? '?'} hue={c?.avatarHue ?? 0} url={c?.avatarUrl} size={38} />
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline gap-2">
+                    <span className="truncate text-[14px] font-semibold">{c?.kind === 'saved' ? 'You' : (c?.title ?? 'Chat')}</span>
+                    <span className="ml-auto shrink-0 text-[11.5px] tabular-nums text-[var(--label-3)]">{timeLabel(m.ts)}</span>
+                  </span>
+                  <span className="mt-[1px] block truncate text-[13px] text-[var(--label-2)]">
+                    {m.from === 'me' ? 'You: ' : c?.kind === 'group' && m.fromName ? `${m.fromName}: ` : ''}{previewOf(m)}
+                  </span>
+                </span>
+              </button>
+              <button
+                onClick={() => doStar(m.chatId, [m.id], false)}
+                title="Unstar"
+                className="absolute right-2 top-2 hidden rounded-full p-1.5 text-[var(--label-3)] hover:bg-[var(--fill-2)] group-hover:block"
+              >
+                <Star size={14} weight="fill" />
+              </button>
+            </div>
+          )
+        })}
+      </div>
+    </PaneShell>
+  )
+})
 
 function InfoRow({ icon, label, onClick, destructive }: { icon: React.ReactNode; label: string; onClick?: () => void; destructive?: boolean }) {
   return (

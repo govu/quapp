@@ -67,6 +67,7 @@ export const Palette = memo(function Palette() {
   }, [q, open, adapter])
 
   const items = useMemo<Item[]>(() => {
+    if (!open) return [] // don't rebuild the whole index while hidden
     const l = q.trim().toLowerCase()
     const out: Item[] = []
     const close = () => setPalette(false)
@@ -139,7 +140,7 @@ export const Palette = memo(function Palette() {
       })
     }
     return out
-  }, [q, chats, order, contacts, hits, theme])
+  }, [q, chats, order, contacts, hits, theme, open])
 
   useEffect(() => {
     // keep the active row in view

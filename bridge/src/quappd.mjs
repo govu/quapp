@@ -26,10 +26,12 @@ import makeWASocket, {
   getKeyAuthor,
   proto,
 } from '@whiskeysockets/baileys'
+import { aesEncryptGCM, hmacSign } from '@whiskeysockets/baileys/lib/Utils/crypto.js'
 import { WebSocketServer } from 'ws'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import crypto from 'node:crypto'
 
 const HOST = process.env.QUAPP_HOST ?? '127.0.0.1'
@@ -38,6 +40,9 @@ const MEDIA_PORT = Number(process.env.QUAPP_MEDIA_PORT ?? 8766)
 const DATA = process.env.QUAPP_DATA ?? path.join(process.cwd(), 'quapp-data')
 const AUTH_DIR = path.join(DATA, 'auth')
 const MEDIA_DIR = path.join(DATA, 'media')
+// user-visible downloads land in Downloads/Quapp — the renderer has no shell
+// IPC, so the daemon owns the destination
+const DOWNLOAD_DIR = path.join(os.homedir(), 'Downloads', 'Quapp')
 const MEDIA_BASE = `http://${HOST}:${MEDIA_PORT}/m`
 for (const d of [AUTH_DIR, MEDIA_DIR]) fs.mkdirSync(d, { recursive: true })
 
@@ -87,6 +92,8 @@ const S = {
   avatarQueued: new Set(),
   metaQueued: new Set(),
   subscribedPresence: new Set(),
+  // media prefetch prefs — wired from the Settings sheet
+  autoDl: { photos: true, docs: false },
   connecting: false,
   lastQr: null,
   backoff: 2000,
@@ -145,7 +152,10 @@ let stateTimer = null
 const markDirty = () => {
   stateDirty = true
   if (stateTimer) return
-  stateTimer = setTimeout(writeState, 4000)
+  // during the initial replay a 4s write cadence re-serializes the whole
+  // archive (proto-encode every bucket + JSON.stringify) on the same event
+  // loop that must service decrypts and keepalives — stretch it to 30s
+  stateTimer = setTimeout(writeState, S.historySeen && !S.historyDone ? 30000 : 4000)
 }
 function writeState() {
   stateTimer = null
@@ -227,6 +237,31 @@ const contactName = (jid) => {
   const c = S.contacts.get(norm(jid))
   return c?.name ?? c?.firstName ?? undefined
 }
+
+// AES-GCM encrypt a PollVoteMessage — the exact inverse of Baileys'
+// decryptPollVote (same key schedule: HMAC(secret, zero32) then
+// HMAC(sign, key0), AAD = "pollMsgId\0voterJid")
+function encryptPollVote(vote, { pollCreatorJid, pollMsgId, pollEncKey, voterJid }) {
+  const tb = (s) => Buffer.from(String(s))
+  const sign = Buffer.concat([tb(pollMsgId), tb(pollCreatorJid), tb(voterJid), tb('Poll Vote'), Buffer.from([1])])
+  const key0 = hmacSign(pollEncKey, new Uint8Array(32), 'sha256')
+  const encKey = hmacSign(sign, key0, 'sha256')
+  const aad = tb(`${pollMsgId}\0${voterJid}`)
+  const encIv = crypto.randomBytes(12)
+  const encPayload = aesEncryptGCM(proto.Message.PollVoteMessage.encode(vote).finish(), encKey, encIv, aad)
+  return { encPayload, encIv }
+}
+
+// chatModify(clear/delete) anchors on the chat's last messages — hand it the
+// newest few raw protos we hold
+function lastMsgAnchors(jid) {
+  const bucket = msgsOf(jid)
+  const out = []
+  for (const e of [...bucket.values()].slice(-3)) {
+    if (e.proto?.key) out.push({ key: e.proto.key, messageTimestamp: e.proto.messageTimestamp })
+  }
+  return out
+}
 // LIDs are privacy aliases — resolve to the real phone jid when we know it
 const resolveJid = (jid) => jid.endsWith('@lid') ? (S.lidToPn.get(jid) ?? jid) : jid
 // canonical filing id for anything arriving as a jid (ZapFast Worker::canonical):
@@ -306,8 +341,17 @@ function rekeyChat(lid, pn) {
   if (S.lastKey.has(lid)) { S.lastKey.set(pn, S.lastKey.get(lid)); S.lastKey.delete(lid) }
   if (pendingOlder.has(lid)) { pendingOlder.set(pn, pendingOlder.get(lid)); pendingOlder.delete(lid) }
   if (historyStart.has(lid)) { historyStart.add(pn); historyStart.delete(lid) }
-  for (const f of [S.flags.favorite, S.flags.unread, S.flags.starred]) {
+  for (const [sid, j] of pendingSid) if (j === lid) pendingSid.set(sid, pn)
+  if (lastTailAsk.has(lid)) { lastTailAsk.set(pn, lastTailAsk.get(lid)); lastTailAsk.delete(lid) }
+  for (const f of [S.flags.favorite, S.flags.unread]) {
     if (f.delete(lid)) f.add(pn)
+  }
+  // starred + mediaDead are compound keys (chatId:id) — rekey each lid entry
+  for (const set of [S.flags.starred, mediaDead]) {
+    for (const k of [...set]) {
+      if (!k.startsWith(lid + ':') && !k.startsWith(lid)) continue
+      set.delete(k); set.add(pn + k.slice(lid.length))
+    }
   }
   if (S.typingTimers.has(lid)) { S.typingTimers.set(pn, S.typingTimers.get(lid)); S.typingTimers.delete(lid) }
   if (S.subscribedPresence.has(lid)) { S.subscribedPresence.add(pn); S.subscribedPresence.delete(lid) }
@@ -583,15 +627,16 @@ function toModel(raw) {
   if (!key?.remoteJid || !key?.id) return null
   const chatId = canonicalJid(norm(key.remoteJid))
   const inner = extractMessageContent(raw.message)
-  if (!inner) return null
-  const type = getContentType(inner)
-
-  // stub/system messages
-  if (raw.messageStubType != null && !inner[type]) {
+  // stub/system messages ("Group created", E2E notice, missed calls…) carry
+  // message:null — check messageStubType BEFORE requiring inner or the whole
+  // STUB table is dead code and system rows silently vanish
+  if (raw.messageStubType != null && (!inner || !inner[getContentType(inner)])) {
     const text = stubText(raw)
     if (!text) return null
     return baseModel(raw, chatId, { kind: 'system', text })
   }
+  if (!inner) return null
+  const type = getContentType(inner)
 
   const content = convertContent(chatId, key.id, inner)
   if (!content) return null
@@ -624,7 +669,7 @@ function baseModel(raw, chatId, content) {
     fromName: fromMe ? undefined : (raw.pushName ?? contactName(from) ?? (chatOf(chatId)?.kind === 'dm' ? undefined : displayName(from))),
     ts: Number(raw.messageTimestamp ?? Date.now() / 1000) * 1000,
     delivery: fromMe ? STATUS[raw.status ?? 2] ?? 'sent' : undefined,
-    starred: !!raw.starred || S.flags.starred.has(chatId + '' + raw.key.id),
+    starred: !!raw.starred || S.flags.starred.has(chatId + ':' + raw.key.id) || S.flags.starred.has(chatId + raw.key.id),
     content,
   }
 }
@@ -659,9 +704,10 @@ function stubText(raw) {
 function storeRaw(raw, model) {
   let bucket = S.msgs.get(model.chatId)
   if (!bucket) S.msgs.set(model.chatId, (bucket = new Map()))
-  if (bucket.size > 20000) { // bound memory: drop oldest
-    const oldest = [...bucket.keys()][0]
-    bucket.delete(oldest)
+  if (bucket.size > 20480) { // bound memory: trim in chunks to insertion-oldest
+    const drop = bucket.size - 20000
+    let i = 0
+    for (const k of bucket.keys()) { bucket.delete(k); if (++i >= drop) break }
   }
   bucket.set(model.id, { proto: raw, model })
   markDirty()
@@ -687,9 +733,11 @@ function storeRaw(raw, model) {
     // cache immediately so the bubble never shows a spinner
     if (S.open && S.historyDone) void mediaBuffer(model.chatId, model.id).catch(() => {})
   }
-  // learn pushNames from messages — the only name source for @lid contacts
+  // learn pushNames from messages — the only name source for @lid contacts.
+  // fromMe rows in DMs carry the peer as remoteJid and OUR name as pushName —
+  // learning it would rename the contact to you
   const sender = canonicalJid(norm(raw.key?.participant ?? raw.key?.remoteJid ?? ''))
-  if (raw.pushName && sender && !isOwnJid(sender)) {
+  if (raw.pushName && sender && !isOwnJid(sender) && !raw.key?.fromMe) {
     S.pushNames.set(sender, raw.pushName)
     // a DM titled '+'+digits or 'WhatsApp user' upgrades to the real name
     const dc = chatOf(sender)
@@ -842,6 +890,7 @@ function onConn({ connection, lastDisconnect, qr }) {
     S.open = true
     S.backoff = 2000
     S.lastQr = null
+    const openSock = S.sock // open-branch timers must not fire into a later socket
     const u = S.sock.user
     const devId = norm(u.id)
     S.me = {
@@ -850,8 +899,10 @@ function onConn({ connection, lastDisconnect, qr }) {
       phone: '+' + devId.split(':')[0],
       lid: u.lid ? norm(u.lid) : undefined,
     }
-    emit({ type: 'linked', account: snapshot().account })
+    emit({ type: 'linked', account: { id: S.me.id, name: S.me.name, phone: S.me.phone } })
+    emit({ type: 'connection', state: 'open', source: 'whatsapp' })
     log('linked as', S.me.name)
+    kickMetaQueue() // queued metadata fetches stalled while the socket was down
     // resolve early if history already arrived or shortly after
     setTimeout(maybeReady, 12000)
     // reconnects never get a history push — without this the "history is
@@ -860,7 +911,7 @@ function onConn({ connection, lastDisconnect, qr }) {
     // if the link raced a 515 restart, history may never arrive — at least
     // pull groups so the chat list isn't empty, and emit what we have
     setTimeout(() => {
-      if (!S.open) return
+      if (!S.open || S.sock !== openSock) return
       if (!S.historyDone && !S.historySeen && S.chats.size < 30) {
         // the phone never pushed the chat list — force a FULL app-state
         // resync by clearing the stored collection versions (return_snapshot
@@ -895,14 +946,17 @@ function onConn({ connection, lastDisconnect, qr }) {
       // history (ZapFast: a chat that synced with a name and no messages gets
       // asked as soon as it loads or opens — we ask in bulk once). Stale
       // covers the real gap: messages lost to a dead session never get
-      // requeued, so the newest tail the phone has must be pulled per chat
+      // requeued, so the newest tail the phone has must be pulled per chat.
+      // Once per session — a flapping link must not re-burst 100 PDO requests.
       setTimeout(() => {
-        if (!S.open) return
+        if (!S.open || S.sock !== openSock || discoveryRan) return
+        discoveryRan = true
         const known = new Set(S.chats.keys())
+        const isDm = (j) => j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')
         const staleBefore = Date.now() - 6 * 3600 * 1000
-        const emptyChats = [...known].filter((j) => !msgsOf(j).size && (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')))
+        const emptyChats = [...known].filter((j) => !msgsOf(j).size && isDm(j))
         const staleChats = [...known].filter((j) => {
-          if (!msgsOf(j).size) return false // empty chats handled above
+          if (!isDm(j) || !msgsOf(j).size) return false // groups/newsletters: the phone won't answer PDO for these
           return lastMsgTs(j) < staleBefore // newest stored msg is old → tail gap
         })
         // PDO requests are phone-answered and rate-limited — WhatsApp stops
@@ -933,6 +987,15 @@ function onConn({ connection, lastDisconnect, qr }) {
   }
   if (connection === 'close') {
     S.open = false
+    S.lastQr = null // a stale QR would be served to a client that reconnects mid-gap
+    // in-flight PDO requests die with the socket — free their jids or every
+    // one stays blocked for the full 90s patience window across reconnects
+    for (const [jid, req] of pendingOlder) {
+      if (req.sid) pendingSid.delete(req.sid)
+      emit({ type: 'older_result', chatId: jid, count: 0, hasMore: true })
+    }
+    pendingOlder.clear()
+    pendingSid.clear()
     // presence subscriptions die with the socket — resubscribe on open
     S.subscribedPresence.clear()
     for (const m of S.typingTimers.values()) for (const { t } of m.values()) clearTimeout(t)
@@ -952,7 +1015,7 @@ function onConn({ connection, lastDisconnect, qr }) {
       log(`connection closed (${code ?? '?'}) ${detail} — reconnecting`)
     }
     S.sock = null
-    emit({ type: 'connection', state: 'closed' })
+    emit({ type: 'connection', state: 'closed', source: 'whatsapp' })
     S.backoff = Math.min((S.backoff ?? 2000) * 2, 30000)
     setTimeout(ensureSocket, code === DisconnectReason.loggedOut ? 500 : S.backoff)
   }
@@ -1058,6 +1121,9 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
       }
       storeRaw(raw, model); n++
       filed.set(model.chatId, (filed.get(model.chatId) ?? 0) + 1)
+      // ON_DEMAND rows must stream to the UI — history_done is suppressed for
+      // these chunks, so without this the phone's answer lands on disk only
+      if (onDemand) emit({ type: 'message', msg: model, backfill: true })
     }
   }
   if (!onDemand && (isLatest || syncType === 0 || syncType === 7)) S.historyDone = true
@@ -1077,16 +1143,31 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
     answerOlder([...counts.entries()].map(([jid, count]) => [jid, count, chatMore.get(jid)]))
   }
   maybeReady()
-  // every chunk (incl. ON_DEMAND fetches) is a reason for the UI to resync
   let total = 0
   for (const b of S.msgs.values()) total += b.size
-  emit({ type: 'sync_progress', chats: S.chats.size, contacts: S.contacts.size, messages: total, progress: progress ?? null })
-  if (S.historyDone && !syncEndEmitted) { syncEndEmitted = true; emit({ type: 'sync_progress', done: true, chats: S.chats.size, contacts: S.contacts.size, messages: total }) }
-  emit({ type: 'history_done' })
+  // ON_DEMAND chunks resolve via older_result — emitting history_done for
+  // them used to chain boot()→markRead()→a new PDO tail request per chunk,
+  // an infinite request loop that burned the phone's PDO budget (it goes
+  // silent after ~15 answers). history_done is only for the real sync now.
+  if (!syncEndEmitted) {
+    emit({ type: 'sync_progress', chats: S.chats.size, contacts: S.contacts.size, messages: total, progress: progress ?? null })
+    // the end of a real sync = silence, not a flag — isLatest is true on the
+    // FIRST processed chunk in Baileys 7, so it can't mark the end. A quiet
+    // window after the last chunk does.
+    clearTimeout(historyQuiet)
+    historyQuiet = setTimeout(() => {
+      S.historyDone = true
+      syncEndEmitted = true
+      emit({ type: 'sync_progress', done: true, chats: S.chats.size, contacts: S.contacts.size, messages: total })
+      emit({ type: 'history_done' })
+    }, 20000)
+    if (!onDemand) emit({ type: 'history_done' })
+  }
   kickMetaQueue()
   void prefetchMedia()
   warmAvatars()
 }
+let historyQuiet = null
 
 // background media warmup — the phone's CDN links are freshest right after
 // history replay, so pull the newest media of the most recent chats into the
@@ -1107,7 +1188,9 @@ async function prefetchMedia() {
       for (const id of [...b.keys()].slice(-25)) {
         const e = b.get(id)
         const k = e?.model?.content?.kind
-        if (!e || !['image', 'video', 'sticker', 'document', 'audio'].includes(k)) continue
+        const wanted = ['image', 'video', 'sticker'].includes(k) ? S.autoDl.photos
+          : ['document', 'audio'].includes(k) ? S.autoDl.docs : false
+        if (!e || !wanted) continue
         if (e.model.ts < cutoff) continue
         const key = c.id + ':' + id
         if (mediaDead.has(key)) continue
@@ -1174,7 +1257,7 @@ function onMessages({ messages, type }) {
     const through = removalPoint.get(jid)
     if (through) {
       if (model.ts > through) removalPoint.delete(jid)
-      else if (type !== 'notify') continue // old replay — chat stays deleted
+      else continue // replayed pre-deletion row — chat stays deleted even via notify redelivery
     }
     const isNewChat = !S.chats.has(jid)
     if (isNewChat) upsertChat({ id: jid })
@@ -1361,21 +1444,24 @@ function onPresence({ id, presences }) {
       if (prev) clearTimeout(prev.t)
       const t = setTimeout(() => {
         m.delete(pjid)
+        if (!m.size) S.typingTimers.delete(chatId) // empty inner maps leak
         emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
       }, 6000)
       m.set(pjid, { t })
       emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
     } else if (state === 'available' || state === 'unavailable') {
       const m = S.typingTimers.get(chatId)
-      if (m?.delete(pjid)) emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
-      emit({ type: 'presence', chatId, online: state === 'available' })
+      if (m?.delete(pjid)) { if (!m.size) S.typingTimers.delete(chatId); emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) }) }
+      // online-status is per-person — in a group, any member's 'unavailable'
+      // would flip the whole chat's dot
+      if (!chatId.endsWith('@g.us')) emit({ type: 'presence', chatId, online: state === 'available' })
     } else if (state === 'paused') {
       const m = S.typingTimers.get(chatId)
-      if (m?.delete(pjid)) emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
+      if (m?.delete(pjid)) { if (!m.size) S.typingTimers.delete(chatId); emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) }) }
     }
     if (state === 'unavailable' && p.lastSeen != null) {
       const c = chatOf(chatId)
-      if (c) { c.lastSeen = Number(p.lastSeen) * 1000; emit({ type: 'chat_update', chat: c }) }
+      if (c?.kind === 'dm') { c.lastSeen = Number(p.lastSeen) * 1000; emit({ type: 'chat_update', chat: c }) }
     }
   }
 }
@@ -1387,6 +1473,7 @@ function queueAvatar(jid) {
   if (S.avatarQueued.has(jid)) return
   S.avatarQueued.add(jid)
   metaQueue.push(async () => {
+    S.avatarQueued.delete(jid) // release BEFORE the await — a miss must be re-queuable later
     await avatarFetch(jid, false).catch(() => {})
   })
   kickMetaQueue()
@@ -1438,7 +1525,7 @@ async function kickMetaQueue() {
   if (metaRunning || !S.open) return
   metaRunning = true
   while (metaQueue.length && S.open) {
-    await metaQueue.shift()()
+    try { await metaQueue.shift()() } catch { /* a poisoned task must not strand the queue */ }
     await sleep(800) // ZapFast paces metadata at ~2/5s — bursts hit rate limits
   }
   metaRunning = false
@@ -1461,6 +1548,11 @@ async function requestHistory(chatId, count = 80, explicit = false, tail = false
   const prev = pendingOlder.get(jid)
   if (prev) { if (explicit) prev.explicit = true; return false }
   const bucket = msgsOf(jid)
+  if (tail) {
+    const lastAsk = lastTailAsk.get(jid)
+    if (lastAsk && Date.now() - lastAsk < TAIL_ASK_COOLDOWN) return false
+    lastTailAsk.set(jid, Date.now())
+  }
   const oldest = bucket.size && !tail
     ? [...bucket.values()].reduce((a, b) => (Number(a.proto.messageTimestamp) < Number(b.proto.messageTimestamp) ? a : b))
     : null
@@ -1490,6 +1582,11 @@ async function requestHistory(chatId, count = 80, explicit = false, tail = false
 // discovery sweep (a dead sweep burns the whole budget). Any response resets.
 let discoveryPauseUntil = 0
 let unansweredStreak = 0
+let discoveryRan = false // the sweep runs once per session — never re-bursts
+// tail-refresh cooldown per chat — a permanently-stale chat (phone answers
+// with nothing new) must not get re-asked on every open/reconnect/boot
+const lastTailAsk = new Map() // jid -> ts
+const TAIL_ASK_COOLDOWN = 20 * 60 * 1000
 
 // ON_DEMAND chunks resolve pending requests (ZapFast answer_older)
 function answerOlder(fileCounts) {
@@ -1499,7 +1596,9 @@ function answerOlder(fileCounts) {
     const req = pendingOlder.get(jid)
     if (req?.sid) pendingSid.delete(req.sid)
     pendingOlder.delete(jid)
-    emit({ type: 'older_result', chatId: jid, count: n, hasMore: n > 0 && moreOnPhone !== 1 && moreOnPhone !== 3 })
+    // a 0-count answer isn't "no more" — the conv record may not say either
+    // way; only an explicit endOfHistoryType 1/3 closes the tail
+    emit({ type: 'older_result', chatId: jid, count: n, hasMore: moreOnPhone !== 1 && moreOnPhone !== 3 })
   }
 }
 
@@ -1560,13 +1659,26 @@ const CMDS = {
     // wipe regardless — the user asked to unpair this device
     S.me = null
     S.historyDone = false
+    S.historySeen = false
     readyEmitted = false
     syncEndEmitted = false
+    clearTimeout(historyQuiet)
     pendingOlder.clear()
     pendingSid.clear()
     historyStart.clear()
     pendingReactions.clear()
     rawGroupMeta.clear()
+    removalPoint.clear() // tombstones belong to the dead account
+    S.lastKey.clear()
+    metaRetry.clear()
+    metaQueue.length = 0
+    S.metaQueued.clear()
+    S.avatarQueued.clear()
+    avatarCache.clear(); avatarIdx.clear(); avatarMiss.clear(); avatarInflight.clear()
+    mediaDead.clear()
+    lastTailAsk.clear()
+    discoveryRan = false
+    discoveryPauseUntil = 0; unansweredStreak = 0
     S.subscribedPresence.clear()
     S.typingTimers.clear()
     S.chats.clear(); S.msgs.clear(); S.contacts.clear()
@@ -1717,7 +1829,8 @@ const CMDS = {
       const entry = msgsOf(chatId).get(id)
       if (!entry) continue
       entry.model.starred = starred
-      const flagKey = chatId + '' + id
+      const flagKey = chatId + ':' + id
+      S.flags.starred.delete(chatId + id) // purge legacy separatorless keys
       starred ? S.flags.starred.add(flagKey) : S.flags.starred.delete(flagKey)
       emit({ type: 'message_update', msg: entry.model })
       try {
@@ -1725,6 +1838,15 @@ const CMDS = {
       } catch { /* starred stays local */ }
     }
     saveFlags()
+  },
+
+  // every starred message across all chats — WhatsApp's Starred screen
+  async starred() {
+    const out = []
+    for (const bucket of S.msgs.values()) {
+      for (const e of bucket.values()) if (e.model.starred) out.push(e.model)
+    }
+    return { msgs: out.sort((a, b) => b.ts - a.ts) }
   },
 
   async openChat({ contactId }) {
@@ -1746,7 +1868,7 @@ const CMDS = {
     // presence subscribe once per session per direct chat — the UI calls
     // markRead on every open, so this is the reliable hook point
     const jid = canonicalJid(norm(chatId))
-    if (!jid.endsWith('@g.us') && !S.subscribedPresence.has(jid)) {
+    if (!jid.endsWith('@g.us') && !jid.endsWith('@newsletter') && !S.subscribedPresence.has(jid)) {
       S.subscribedPresence.add(jid)
       void S.sock?.presenceSubscribe(jid).catch(() => {})
     }
@@ -1761,7 +1883,11 @@ const CMDS = {
     }
     // ZapFast: a chat that opened with no local messages asks the phone — and
     // a chat whose newest message is older than a couple hours gets its TAIL
-    // refreshed (now-anchor — a backward anchor can never reach the gap)
+    // refreshed (now-anchor — a backward anchor can never reach the gap).
+    // Skipped while the initial sync is still streaming (the boot→markRead
+    // chain would fire a PDO per re-snapshot — that's the burst that made
+    // the phone go silent). requestHistory's own 20min cooldown caps the rest.
+    if (S.historySeen && !S.historyDone) return
     if (!msgsOf(jid).size) void requestHistory(jid, 80, true, true)
     else if (Date.now() - (lastMsgTs(jid) || 0) > 2 * 3600 * 1000) void requestHistory(jid, 50, true, true)
   },
@@ -1779,13 +1905,13 @@ const CMDS = {
     try { await S.sock.sendPresenceUpdate(typing ? 'composing' : 'paused', norm(chatId)) } catch { /* offline */ }
   },
 
-  async setChatFlag({ chatId, flag, value }) {
+  async setChatFlag({ chatId, flag, value, muteMs }) {
     const chat = chatOf(chatId)
     if (!chat) return
     const jid = norm(chatId)
     try {
       if (flag === 'pinned') await S.sock.chatModify({ pin: value }, jid)
-      else if (flag === 'muted') await S.sock.chatModify({ mute: value ? 8 * 3600 * 1000 * 24 * 365 : null }, jid)
+      else if (flag === 'muted') await S.sock.chatModify({ mute: value ? (muteMs == null ? -1 : Date.now() + muteMs) : null }, jid)
       else if (flag === 'archived') {
         const newest = sortedMsgs(chatId).at(-1)
         const lastKey = newest && msgsOf(chatId).get(newest.id)?.proto?.key
@@ -1803,13 +1929,40 @@ const CMDS = {
   },
 
   async vote({ chatId, messageId, optionIndexes }) {
-    // sending poll votes needs the encrypted vote message construction;
-    // reflect the user's selection locally until a proper impl lands.
     const entry = msgsOf(chatId).get(messageId)
-    if (entry?.model.content.kind === 'poll') {
-      entry.model.content.voted = optionIndexes
-      emit({ type: 'message_update', msg: entry.model })
-    }
+    if (entry?.model.content.kind !== 'poll') return { error: 'not a poll' }
+    // reflect the pick immediately — the wire may lag or fail
+    entry.model.content.voted = optionIndexes
+    emit({ type: 'message_update', msg: entry.model })
+    const pollMsg = entry.proto?.message?.pollCreationMessage
+      ?? entry.proto?.message?.pollCreationMessageV2
+      ?? entry.proto?.message?.pollCreationMessageV3
+    const secret = entry.proto?.message?.messageContextInfo?.messageSecret
+    if (!S.sock || !pollMsg || !secret) return { error: 'vote stays local — missing poll secret' }
+    try {
+      const options = (pollMsg.options ?? []).map((o) => o.optionName ?? '')
+      const selectedOptions = optionIndexes
+        .map((i) => options[i])
+        .filter(Boolean)
+        .map((name) => crypto.createHash('sha256').update(name).digest())
+      const key = entry.proto.key
+      const voterJid = S.me?.lid ?? ownJid()
+      const pollUpdateMessage = {
+        pollCreationMessageKey: {
+          remoteJid: norm(key.remoteJid),
+          id: key.id,
+          fromMe: !!key.fromMe,
+          participant: key.fromMe ? undefined : key.participant,
+        },
+        vote: encryptPollVote(
+          { selectedOptions },
+          { pollCreatorJid: key.fromMe ? ownJid() : norm(key.participant ?? key.remoteJid), pollMsgId: key.id, pollEncKey: secret, voterJid },
+        ),
+        senderTimestampMs: Date.now(),
+      }
+      await S.sock.sendMessage(norm(chatId), { pollUpdateMessage })
+      return { ok: true }
+    } catch (e) { return { error: e?.message } }
   },
 
   // real privacy settings — mirrors WhatsApp's own toggles
@@ -1829,6 +1982,30 @@ const CMDS = {
 
   async blocklist() {
     try { return { jids: await S.sock.fetchBlocklist() } } catch { return { jids: [] } }
+  },
+
+  async block({ jid, blocked }) {
+    await S.sock.updateBlockStatus(norm(jid), blocked ? 'block' : 'unblock')
+    return { ok: true }
+  },
+
+  async groupEdit({ chatId, subject, description }) {
+    const jid = norm(chatId)
+    if (subject != null) await S.sock.groupUpdateSubject(jid, subject)
+    if (description != null) await S.sock.groupUpdateDescription(jid, description)
+    const c = chatOf(jid)
+    if (c && subject != null) { c.title = subject; emit({ type: 'chat_update', chat: c }) }
+    return { ok: true }
+  },
+
+  // Settings-sheet prefs pushed into the daemon
+  async prefs({ autoDlPhotos, autoDlDocs, linkPreviews }) {
+    if (autoDlPhotos != null) S.autoDl.photos = !!autoDlPhotos
+    if (autoDlDocs != null) S.autoDl.docs = !!autoDlDocs
+    if (linkPreviews != null && S.sock?.updateDisableLinkPreviewsPrivacy) {
+      try { await S.sock.updateDisableLinkPreviewsPrivacy(!linkPreviews) } catch { /* privacy action failed */ }
+    }
+    return { ok: true }
   },
 
   // rich contact profile for the info pane — about, business info, hi-res pic.
@@ -1862,10 +2039,41 @@ const CMDS = {
     return payload
   },
 
+  // clear the visible history but keep the chat row — mirrors WhatsApp's
+  // "Clear chat"; the sync action propagates to the phone
+  async clearChat({ chatId }) {
+    const jid = canonicalJid(norm(chatId))
+    await S.sock.chatModify({ clear: true, lastMessages: lastMsgAnchors(jid) }, jid)
+    S.msgs.get(jid)?.clear()
+    S.lastKey.delete(jid)
+    const c = chatOf(jid)
+    if (c) { c.unread = 0; emit({ type: 'chat_update', chat: c }) }
+    emit({ type: 'chat_cleared', chatId: jid })
+    markDirty()
+    return { ok: true }
+  },
+
+  // remove the whole conversation — WhatsApp's "Delete chat"
+  async deleteChat({ chatId }) {
+    const jid = canonicalJid(norm(chatId))
+    await S.sock.chatModify({ delete: true, lastMessages: lastMsgAnchors(jid) }, jid)
+    S.chats.delete(jid)
+    S.msgs.delete(jid)
+    S.lastKey.delete(jid)
+    emit({ type: 'chat_removed', chatId: jid })
+    markDirty()
+    return { ok: true }
+  },
+
   async leaveGroup({ chatId }) {
-    await S.sock.groupLeave(norm(chatId))
-    const chat = chatOf(norm(chatId))
-    if (chat) { S.chats.delete(norm(chatId)); emit({ type: 'chat_update', chat: { ...chat, kind: 'dm', title: chat.title + ' (left)' } }) }
+    const jid = canonicalJid(norm(chatId))
+    await S.sock.groupLeave(jid)
+    // remove the chat outright — a "(left)" ghost DM with a live composer
+    // just invites sends that can only fail
+    S.chats.delete(jid)
+    S.msgs.delete(jid)
+    emit({ type: 'chat_removed', chatId: jid })
+    markDirty()
     return { ok: true }
   },
 
@@ -1913,7 +2121,14 @@ const CMDS = {
     const buf = await mediaBuffer(chatId, messageId)
     if (!buf) return { error: 'unavailable' }
     const name = path.basename(mediaFileName(entry.proto) ?? `${messageId}.bin`).replace(/[^\w .()\[\]-]/g, '_')
-    const out = path.join(MEDIA_DIR, `${messageId.slice(0, 24)}-${name}`)
+    fs.mkdirSync(DOWNLOAD_DIR, { recursive: true })
+    let out = path.join(DOWNLOAD_DIR, name)
+    // don't clobber an earlier download of the same filename
+    for (let i = 1; fs.existsSync(out) && i < 100; i++) {
+      const ext = path.extname(name), stem = name.slice(0, name.length - ext.length)
+      out = path.join(DOWNLOAD_DIR, `${stem} (${i})${ext}`)
+    }
+    if (!path.resolve(out).startsWith(path.resolve(DOWNLOAD_DIR) + path.sep)) return { error: 'invalid name' }
     fs.writeFileSync(out, buf)
     return { path: out }
   },
@@ -1969,16 +2184,37 @@ function mediaFileName(protoMsg) {
   return c.fileName ?? c.caption?.slice(0, 40) ?? null
 }
 // mediaDead marks messages whose download is permanently exhausted (dead CDN +
-// declined/failed phone re-upload). Retrying costs a 45s reupload wait — a
-// fresh proto arriving via history replay clears the mark (new signed URLs)
+// declined/failed phone re-upload). Only DEFINITIVE signals mark it — a
+// transient timeout or socket blip must not blank media for the session.
+// A fresh proto arriving via history replay clears the mark (new signed URLs)
 const mediaDead = new Set()
+// concurrent /m/ hits for the same message share one download — otherwise N
+// viewers each spawn their own reupload request + 45s wait
+const mediaInflight = new Map() // deadKey -> Promise<Buffer|'gone'|null>
+const stripUrls = (s) => String(s ?? '').replace(/https?:\/\/\S+/g, '<url>')
+
+// no async listener may kill the process — Node ≥15 exits on unhandled
+// rejection; log and keep the bridge alive (state is reconciled on the fly)
+process.on('unhandledRejection', (e) => log('unhandled rejection:', stripUrls(e?.message ?? e)))
+process.on('uncaughtException', (e) => log('uncaught exception:', stripUrls(e?.message ?? e)))
 
 async function mediaBuffer(chatId, messageId) {
-  const entry = msgsOf(chatId).get(messageId)
+  const canon = canonicalJid(norm(chatId)) // same msg under @lid vs @s spellings shares the key
+  const deadKey = canon + ':' + messageId
+  let p = mediaInflight.get(deadKey)
+  if (!p) {
+    p = mediaBufferInner(canon, chatId, messageId, deadKey)
+    mediaInflight.set(deadKey, p)
+    p.finally(() => mediaInflight.delete(deadKey))
+  }
+  return p
+}
+
+async function mediaBufferInner(canon, chatId, messageId, deadKey) {
+  const entry = msgsOf(canon).get(messageId) ?? msgsOf(chatId).get(messageId)
   if (!entry) return null
-  const deadKey = chatId + ':' + messageId
   if (mediaDead.has(deadKey)) return 'gone'
-  const cache = path.join(MEDIA_DIR, enc(chatId) + '--' + enc(messageId))
+  const cache = path.join(MEDIA_DIR, enc(canon) + '--' + enc(messageId))
   try {
     if (fs.existsSync(cache)) return fs.readFileSync(cache)
   } catch { /* fall through */ }
@@ -1992,15 +2228,15 @@ async function mediaBuffer(chatId, messageId) {
       }),
       sleep(45_000).then(() => { throw new Error('media download timed out') }),
     ])
-    fs.writeFileSync(cache, buf)
+    try { fs.writeFileSync(cache, buf) } catch { /* ENOSPC etc — still serve it */ }
     return buf
   } catch (e) {
     const msg = e?.message ?? ''
     // 'No valid media URL' = view-once consumed elsewhere / media genuinely
-    // gone — 410 Gone so the UI can render 'unavailable' instead of retrying
-    if (/No valid media URL/i.test(msg)) { log('media gone (view-once/redacted):', messageId); mediaDead.add(deadKey); return 'gone' }
-    log('media download failed:', msg)
-    mediaDead.add(deadKey)
+    // gone — 410 Gone so the UI can render 'unavailable' instead of retrying.
+    // Transient errors (timeout, network, dead socket) do NOT mark dead.
+    if (/No valid media URL/i.test(msg)) { mediaDead.add(deadKey); return 'gone' }
+    log('media download failed:', stripUrls(msg))
     return null
   }
 }
@@ -2009,7 +2245,11 @@ function mediaMime(chatId, messageId) {
   const inner = entry && extractMessageContent(entry.proto.message)
   if (!inner) return 'application/octet-stream'
   const c = inner[getContentType(inner)] ?? {}
-  return c.mimetype ?? 'application/octet-stream'
+  // unvalidated mimetype lands verbatim in writeHead — control chars throw
+  // ERR_INVALID_CHAR (remote crash), and text/html would run attacker JS on
+  // our origin and steal ?token=. Whitelist the type grammar.
+  const m = c.mimetype
+  return /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/.test(m) ? m : 'application/octet-stream'
 }
 
 // ---------- avatar pipeline ----------
@@ -2072,7 +2312,21 @@ async function avatarFetch(jid, big) {
       if (!url) throw new Error('no picture')
       const r = await fetch(url)
       if (!r.ok) throw new Error('cdn ' + r.status)
-      const buf = Buffer.from(await r.arrayBuffer())
+      // cap the read — a malformed/huge CDN response must not OOM the daemon
+      const reader = r.body?.getReader?.()
+      let buf
+      if (reader) {
+        const chunks = []
+        let total = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          total += value.length
+          if (total > 10 * 1024 * 1024) { await reader.cancel(); throw new Error('avatar too large') }
+          chunks.push(value)
+        }
+        buf = Buffer.concat(chunks)
+      } else buf = Buffer.from(await r.arrayBuffer())
       const entry = { buf, mime: r.headers.get('content-type') ?? 'image/jpeg', at: Date.now() }
       avatarCache.set(jid, entry)
       // a hi-res fetch upgrades the stored copy; a preview fetch only fills a void
@@ -2094,45 +2348,57 @@ async function avatarFetch(jid, big) {
   return p
 }
 
+const safeDec = (s) => { try { return decodeURIComponent(s) } catch { return null } }
+const MEDIA_HEADERS = { 'content-security-policy': 'sandbox', 'x-content-type-options': 'nosniff' }
 const mediaServer = http.createServer(async (req, res) => {
-  if (!DEV && /[?&]token=([^&]+)/.exec(req.url ?? '')?.[1] !== TOKEN) { res.writeHead(403).end(); return }
-  const av = /^\/a\/([^/?]+)/.exec(req.url ?? '')
-  if (av) {
-    const jid = decodeURIComponent(av[1])
-    const hit = await avatarFetch(jid, /[?&]big=1/.test(req.url ?? ''))
-    if (!hit) { res.writeHead(404).end(); return }
-    res.writeHead(200, { 'content-type': hit.mime, 'cache-control': 'private, max-age=300' })
-    res.end(hit.buf)
-    return
-  }
-  const m = /^\/m\/([^/]+)\/([^/?]+)/.exec(req.url ?? '')
-  if (!m) { res.writeHead(404).end(); return }
-  const [, chatId, msgId] = m.map(decodeURIComponent)
-  const buf = await mediaBuffer(chatId, msgId)
-  if (buf === 'gone') { res.writeHead(410).end(); return }
-  if (!buf) { res.writeHead(404).end(); return }
-  const mime = mediaMime(chatId, msgId)
-  // Range support: <audio>/<video> need it for duration probing + seeking;
-  // without it Chrome may refuse ogg/opus playback entirely
-  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '')
-  if (range && (range[1] || range[2])) {
-    const start = range[1] ? parseInt(range[1]) : Math.max(0, buf.length - parseInt(range[2]))
-    const end = range[2] ? Math.min(buf.length - 1, parseInt(range[2])) : buf.length - 1
-    if (start >= buf.length || end < start) {
-      res.writeHead(416, { 'content-range': `bytes */${buf.length}` }).end()
+  try {
+    if (!DEV && /[?&]token=([^&]+)/.exec(req.url ?? '')?.[1] !== TOKEN) { res.writeHead(403).end(); return }
+    const av = /^\/a\/([^/?]+)/.exec(req.url ?? '')
+    if (av) {
+      const jid = safeDec(av[1])
+      if (!jid) { res.writeHead(404).end(); return }
+      const hit = await avatarFetch(jid, /[?&]big=1/.test(req.url ?? ''))
+      if (!hit) { res.writeHead(404).end(); return }
+      res.writeHead(200, { 'content-type': hit.mime, 'cache-control': 'private, max-age=300', ...MEDIA_HEADERS })
+      res.end(hit.buf)
       return
     }
-    res.writeHead(206, {
-      'content-type': mime, 'accept-ranges': 'bytes',
-      'content-range': `bytes ${start}-${end}/${buf.length}`,
-      'content-length': end - start + 1,
-      'cache-control': 'private, max-age=86400',
-    })
-    res.end(buf.subarray(start, end + 1))
-    return
+    const m = /^\/m\/([^/]+)\/([^/?]+)/.exec(req.url ?? '')
+    if (!m) { res.writeHead(404).end(); return }
+    const chatId = safeDec(m[1]); const msgId = safeDec(m[2])
+    if (chatId == null || msgId == null) { res.writeHead(404).end(); return }
+    const buf = await mediaBuffer(chatId, msgId)
+    if (buf === 'gone') { res.writeHead(410).end(); return }
+    if (!buf) { res.writeHead(404).end(); return }
+    const mime = mediaMime(chatId, msgId)
+    // Range support: <audio>/<video> need it for duration probing + seeking;
+    // without it Chrome may refuse ogg/opus playback entirely
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '')
+    if (range && (range[1] || range[2])) {
+      const start = range[1] ? parseInt(range[1]) : Math.max(0, buf.length - parseInt(range[2]))
+      // suffix form bytes=-N means "last N bytes" — the end is always buf.length-1
+      const end = range[1] ? Math.min(buf.length - 1, range[2] ? parseInt(range[2]) : buf.length - 1) : buf.length - 1
+      if (start >= buf.length || end < start) {
+        res.writeHead(416, { 'content-range': `bytes */${buf.length}` }).end()
+        return
+      }
+      res.writeHead(206, {
+        'content-type': mime, 'accept-ranges': 'bytes',
+        'content-range': `bytes ${start}-${end}/${buf.length}`,
+        'content-length': end - start + 1,
+        'cache-control': 'private, max-age=86400',
+        ...MEDIA_HEADERS,
+      })
+      res.end(buf.subarray(start, end + 1))
+      return
+    }
+    res.writeHead(200, { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': buf.length, 'cache-control': 'private, max-age=86400', ...MEDIA_HEADERS })
+    res.end(buf)
+  } catch (e) {
+    // an async listener rejection used to kill the daemon — never again
+    log('media req error:', stripUrls(e?.message))
+    try { res.writeHead(500).end() } catch { /* socket gone */ }
   }
-  res.writeHead(200, { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': buf.length, 'cache-control': 'private, max-age=86400' })
-  res.end(buf)
 })
 
 // ---------- websocket ----------
@@ -2159,8 +2425,8 @@ wss.on('connection', (ws) => {
     let f
     try { f = JSON.parse(data) } catch { return }
     const { id, cmd } = f
-    const handler = CMDS[cmd]
-    if (!handler || id == null) return
+    const handler = Object.hasOwn(CMDS, cmd) ? CMDS[cmd] : null
+    if (typeof handler !== 'function' || id == null) return
     try {
       const result = await handler(f)
       respond(ws, id, true, result ?? null)
@@ -2179,5 +2445,12 @@ process.on('exit', () => { if (stateDirty) { try { stateTimer && clearTimeout(st
 process.on('SIGINT', () => process.exit(0))
 process.on('SIGTERM', () => process.exit(0))
 
-process.on('SIGTERM', () => process.exit(0))
-process.on('SIGINT', () => process.exit(0))
+// parent watch — if the app process dies (crash/kill), the daemon must not
+// keep the WhatsApp session online as an orphan
+const PARENT_PID = Number(process.env.QUAPP_PARENT_PID ?? 0)
+if (PARENT_PID > 0) {
+  setInterval(() => {
+    try { process.kill(PARENT_PID, 0) }
+    catch { log('parent gone — exiting'); process.exit(0) }
+  }, 10000).unref()
+}

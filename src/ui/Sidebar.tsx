@@ -3,12 +3,12 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   Archive, BellSlash, Checks, Check, Clock, Gear, MagnifyingGlass, PencilSimple,
-  PushPin, Plus, Users, Star, ArrowLeft, X,
+  PushPin, Plus, Trash, Users, Star, ArrowLeft, X,
 } from '@phosphor-icons/react'
 import type { Chat, Id } from '../bridge/types'
 import { cx, highlight, listTime } from '../lib/util'
 import {
-  doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setQuery, setRelinkPrompt,
+  confirmClearChat, confirmDeleteChat, doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setPane, setQuery, setRelinkPrompt,
   setSettingsOpen, setShowArchived, useStore, type Filter,
 } from '../store'
 import { Avatar } from './common'
@@ -67,11 +67,16 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
   const menu = (e: React.MouseEvent) => {
     showContextMenu(e, [
       { label: chat.pinned ? 'Unpin' : 'Pin', icon: <PushPin size={16} />, onClick: () => doFlag(id, 'pinned', !chat.pinned) },
-      { label: chat.muted ? 'Unmute' : 'Mute', icon: <BellSlash size={16} />, onClick: () => doFlag(id, 'muted', !chat.muted) },
+      { label: 'Unmute', icon: <BellSlash size={16} />, onClick: () => doFlag(id, 'muted', false), hidden: !chat.muted },
+      { label: 'Mute · 8 hours', icon: <BellSlash size={16} />, onClick: () => doFlag(id, 'muted', true, 8 * 3600e3), hidden: chat.muted },
+      { label: 'Mute · 1 week', icon: <BellSlash size={16} />, onClick: () => doFlag(id, 'muted', true, 7 * 86400e3), hidden: chat.muted },
+      { label: 'Mute always', icon: <BellSlash size={16} />, onClick: () => doFlag(id, 'muted', true), hidden: chat.muted },
       { label: chat.markedUnread ? 'Mark as read' : 'Mark as unread', icon: <Checks size={16} />, onClick: () => doMarkUnread(id, !chat.markedUnread) },
       { label: chat.favorite ? 'Remove from favorites' : 'Add to favorites', icon: <Star size={16} />, onClick: () => doFlag(id, 'favorite', !chat.favorite), disabled: chat.kind === 'channel' },
       { label: chat.archived ? 'Unarchive' : 'Archive', icon: <Archive size={16} />, onClick: () => doFlag(id, 'archived', !chat.archived), separatorAbove: true },
       { label: 'Mark as read', icon: <Checks size={16} />, onClick: () => doMarkRead(id), hidden: !(chat.unread > 0 || chat.markedUnread) },
+      { label: 'Clear chat', icon: <Trash size={16} />, onClick: () => confirmClearChat(id), separatorAbove: true, hidden: chat.kind === 'saved' },
+      { label: 'Delete chat', icon: <Trash size={16} />, destructive: true, onClick: () => confirmDeleteChat(id), hidden: chat.kind === 'saved' },
     ])
   }
   return (
@@ -86,10 +91,10 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
       <div className="relative">
         <Avatar name={chat.title} hue={chat.avatarHue} url={chat.avatarUrl} size={42} />
         {online && chat.kind === 'dm' && (
-          <span className="absolute -bottom-px -right-px size-[12px] rounded-full bg-[var(--green)] ring-[2.5px] ring-[var(--sidebar-solid)]" />
+          <span className="absolute -bottom-px -right-px size-[12px] rounded-full bg-[var(--green)] ring-[2.5px] ring-[var(--dot-ring)]" />
         )}
         {chat.kind === 'group' && (
-          <span className="absolute -bottom-0.5 -right-0.5 grid size-[18px] place-items-center rounded-full bg-[var(--fill)] text-[var(--label-2)] ring-2 ring-[var(--sidebar-solid)]">
+          <span className="absolute -bottom-0.5 -right-0.5 grid size-[18px] place-items-center rounded-full bg-[var(--fill)] text-[var(--label-2)] ring-2 ring-[var(--dot-ring)]">
             <Users size={11} weight="fill" />
           </span>
         )}
@@ -107,7 +112,7 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
           {pv.icon === 'checks' && <Checks size={14} className="shrink-0 text-[var(--label-3)]" />}
           {pv.icon === 'check' && <Check size={14} className="shrink-0 text-[var(--label-3)]" />}
           {pv.icon === 'clock' && <Clock size={13} className="shrink-0 text-[var(--label-3)]" />}
-          {pv.icon === 'checks-read' && <Checks size={14} className="shrink-0 text-[var(--tick-read)]" />}
+          {pv.icon === 'checks-read' && <Checks size={14} className="shrink-0 text-[var(--tick-list)]" />}
           <span className={cx('truncate text-[13.5px] leading-[17px]', isTyping ? 'text-[var(--green)] font-medium' : 'text-[var(--label-2)]')}>
             {draft && !isTyping ? (
               <><span className="text-[var(--red)]">Draft: </span>{draft}</>
@@ -159,6 +164,8 @@ export function Sidebar() {
   const activeChat = useStore((s) => s.activeChat)
   const account = useStore((s) => s.account)
   const syncing = useStore((s) => s.syncing)
+  const bridgeStatus = useStore((s) => s.bridgeStatus)
+  const demoMode = useStore((s) => s.demoMode)
   const scrollRef = useRef<HTMLDivElement>(null)
   const [accountOpen, setAccountOpen] = useState(false)
 
@@ -210,7 +217,7 @@ export function Sidebar() {
             aria-label="Accounts"
           >
             <Avatar name={account?.name ?? 'You'} hue={account?.avatarHue ?? 210} size={36} />
-            <span className="absolute -bottom-0.5 -right-0.5 size-[9px] rounded-full bg-[var(--blue)] ring-2 ring-[var(--sidebar-solid)]" />
+            <span className="absolute -bottom-0.5 -right-0.5 size-[9px] rounded-full bg-[var(--blue)] ring-2 ring-[var(--dot-ring)]" />
           </button>
           <AnimatePresence>
             {accountOpen && (
@@ -232,6 +239,13 @@ export function Sidebar() {
                     </div>
                     <Check size={16} weight="bold" className="ml-auto text-[var(--blue)]" />
                   </div>
+                  <button
+                    className="press mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]"
+                    onClick={() => { setAccountOpen(false); setPane('starred') }}
+                  >
+                    <span className="grid size-[26px] place-items-center rounded-full bg-[var(--fill)]"><Star size={14} /></span>
+                    Starred messages
+                  </button>
                   <button
                     className="press mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]"
                     onClick={() => { setAccountOpen(false); setRelinkPrompt(true) }}
@@ -282,7 +296,17 @@ export function Sidebar() {
         </div>
       </div>
 
+      {/* bridge status — the only visible signal when the daemon/WA socket
+          drops mid-session; without it the app looks live while dead */}
+      {bridgeStatus !== 'ready' && !demoMode && (
+        <div className="mx-2 mb-1.5 flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-3 py-[7px] text-[12.5px] text-[var(--label-2)]">
+          <span className="size-3 animate-spin rounded-full border-2 border-[var(--orange)] border-t-transparent" />
+          <span className="truncate">{bridgeStatus === 'error' ? 'Connection problem — retrying…' : 'Reconnecting…'}</span>
+        </div>
+      )}
+
       {/* filter chips */}
+      {!showArchived && (
       <div className="flex gap-1.5 overflow-x-auto px-3 pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {FILTERS.map((f) => {
           const active = filter === f.id && !showArchived
@@ -302,6 +326,7 @@ export function Sidebar() {
           )
         })}
       </div>
+      )}
 
       {/* live history-sync indicator — keeps the user informed while the
           phone pushes chats/messages so they don't think the app stalled */}

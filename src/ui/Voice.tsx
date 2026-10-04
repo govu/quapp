@@ -90,12 +90,25 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
       <div
         ref={barsRef}
         onClick={seek}
-        className="flex h-[30px] min-w-0 flex-1 cursor-pointer items-center gap-[2.5px] overflow-hidden"
+        className="flex h-[30px] min-w-0 flex-1 cursor-pointer items-center gap-[2.5px] overflow-hidden rounded-[4px]"
         role="slider"
+        tabIndex={0}
         aria-valuemin={0}
         aria-valuemax={dur}
-        aria-valuenow={pos}
+        aria-valuenow={Math.round(pos)}
+        aria-valuetext={durationLabel(pos)}
         aria-label="Seek"
+        onKeyDown={(e) => {
+          const a = audioRef.current
+          if (!a || !dur) return
+          const step = e.key === 'ArrowRight' ? 5 : e.key === 'ArrowLeft' ? -5 : 0
+          if (step) {
+            e.preventDefault()
+            const t = Math.min(Math.max(pos + step, 0), dur)
+            a.currentTime = t
+            setPos(t)
+          }
+        }}
       >
         {bars.map((v, i) => {
           const played = i / bars.length <= frac
@@ -109,7 +122,7 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
         })}
       </div>
       <span className={cx('shrink-0 text-[11.5px] tabular-nums', out ? 'text-white/75' : 'text-[var(--label-2)]')}>
-        {fail === 2 ? 'n/a' : fail === 1 ? '…' : durationLabel(pos > 0 && playing ? pos : dur)}
+        {fail === 2 ? '—' : fail === 1 ? '…' : durationLabel(pos > 0 && playing ? pos : dur)}
       </span>
     </div>
   )

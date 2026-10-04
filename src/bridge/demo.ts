@@ -144,8 +144,8 @@ export class DemoAdapter implements ClientAdapter {
     return Promise.resolve(chat)
   }
 
-  send(chatId: Id, content: OutContent, replyTo?: ReplyRef) {
-    const id = uid()
+  send(chatId: Id, content: OutContent, replyTo?: ReplyRef, clientId?: Id) {
+    const id = clientId ?? uid() // reconcile with the store's optimistic row
     const msg: Message = {
       id, chatId, from: 'me', ts: Date.now(), delivery: 'pending',
       content: content as Message['content'], replyTo,
@@ -297,6 +297,13 @@ export class DemoAdapter implements ClientAdapter {
   pinMessage(chatId: Id, messageId: Id, pin: boolean) {
     const c = this.chats.get(chatId)
     if (c) { c.pinnedMessageId = pin ? messageId : undefined; this.emit({ type: 'chat_update', chat: c }) }
+  }
+  clearChat(chatId: Id) { this.emit({ type: 'chat_cleared', chatId }) }
+  deleteChat(chatId: Id) { this.emit({ type: 'chat_removed', chatId }) }
+  async starred() {
+    const out: Message[] = []
+    for (const arr of this.msgs.values()) for (const m of arr) if (m.starred) out.push(m)
+    return out.sort((a, b) => b.ts - a.ts)
   }
   async leaveGroup(_chatId: Id) { /* demo */ }
   setPrivacy(_setting: string, _value: string) { /* demo */ }

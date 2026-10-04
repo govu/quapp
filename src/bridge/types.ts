@@ -47,6 +47,8 @@ export interface Chat {
   draft?: string
   /** id of pinned message, if the chat has one */
   pinnedMessageId?: Id
+  /** last time this contact was seen online (dms) */
+  lastSeen?: number
   ephemeral?: boolean
   youAdmin?: boolean
   contactId?: Id
@@ -148,7 +150,8 @@ export type ServerEvent =
   | { type: 'presence'; chatId: Id; online: boolean; lastSeen?: number }
   /** real pairing QR payload from the bridge — render it for the user to scan */
   | { type: 'qr'; qr: string }
-  | { type: 'connection'; state: 'open' | 'closed' }
+  /** 'bridge' = UI↔daemon socket · 'whatsapp' = daemon↔WhatsApp socket */
+  | { type: 'connection'; state: 'open' | 'closed'; source?: 'bridge' | 'whatsapp' }
   | { type: 'history_done' }
   | { type: 'older_result'; chatId: Id; count: number; hasMore: boolean }
   | { type: 'sync_progress'; chats: number; contacts: number; messages: number; progress?: number | null; done?: boolean }
@@ -174,7 +177,8 @@ export interface ClientAdapter {
   connect(): Promise<Snapshot>
   loadOlder(chatId: Id, beforeTs: number, limit: number): Promise<MessagePage>
   searchMessages(chatId: Id, query: string): Promise<Message[]>
-  send(chatId: Id, content: OutContent, replyTo?: ReplyRef, clientId?: Id): void
+  /** rejects on transport failure so the optimistic row can flip to 'failed' */
+  send(chatId: Id, content: OutContent, replyTo?: ReplyRef, clientId?: Id): Promise<void> | void
   edit(chatId: Id, messageId: Id, text: string): void
   delete(chatId: Id, messageIds: Id[], forEveryone: boolean): void
   react(chatId: Id, messageId: Id, emoji: string | null): void
@@ -188,17 +192,31 @@ export interface ClientAdapter {
   markRead(chatId: Id): void
   markUnread(chatId: Id, value: boolean): void
   setTyping(chatId: Id, typing: boolean): void
-  setChatFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', value: boolean): void
+  setChatFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', value: boolean, muteMs?: number): void
+  /** push Settings-sheet prefs the bridge owns (auto-download, link previews) */
+  prefs?(p: { autoDlPhotos?: boolean; autoDlDocs?: boolean; linkPreviews?: boolean }): void
   vote(chatId: Id, messageId: Id, optionIndexes: number[]): void
   /** unlink this device — the bridge wipes its session and emits a fresh QR */
   logout(): void
   /** optional advanced ops — demo may no-op */
   pinMessage?(chatId: Id, messageId: Id, pin: boolean): void
+  /** clear the visible history, keep the chat — synced to the phone */
+  clearChat?(chatId: Id): void
+  /** delete the conversation entirely — synced to the phone */
+  deleteChat?(chatId: Id): void
   leaveGroup?(chatId: Id): Promise<void>
   setPrivacy?(setting: 'lastSeen' | 'profilePhoto' | 'groupsAdd' | 'readReceipts' | 'status', value: string): void
   blocklist?(): Promise<string[]>
   /** fetch a contact's rich profile (about/business/hi-res pic warm) */
   profile?(jid: Id): Promise<ProfileInfo | { error?: string }>
+  /** all starred messages across chats — the Starred screen */
+  starred?(): Promise<Message[]>
+  /** save a media/document message to the downloads folder */
+  download?(chatId: Id, messageId: Id): Promise<{ path?: string; error?: string }>
+  /** block/unblock a contact or chat jid */
+  block?(jid: Id, blocked: boolean): void
+  /** group subject/description — admin only; errors surface via bridge_error */
+  groupEdit?(chatId: Id, p: { subject?: string; description?: string }): void
   storageStats?(): Promise<{ bytes: number; files: number }>
   clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void

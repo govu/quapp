@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { Check, DeviceMobile, QrCode, ArrowClockwise } from '@phosphor-icons/react'
-import QRCode from 'qrcode'
 import { spring } from '../lib/util'
 import { retryBoot, useStore } from '../store'
 
@@ -34,9 +33,11 @@ function RealQR({ payload }: { payload: string }) {
   const [svg, setSvg] = useState('')
   useEffect(() => {
     let live = true
-    void QRCode.toString(payload, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' }).then((s) => {
-      if (live) setSvg(s)
-    })
+    // lazy: the QR lib (~50kb) only loads on the pairing screen
+    void import('qrcode').then((m) => {
+      const QRCode = (m as { default?: typeof m }).default ?? m
+      return QRCode.toString(payload, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' })
+    }).then((s) => { if (live) setSvg(s) })
     return () => { live = false }
   }, [payload])
   if (!svg) return <div className="size-full animate-pulse rounded-md bg-black/5" />

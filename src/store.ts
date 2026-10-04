@@ -4,7 +4,7 @@ import type {
 } from './bridge/types'
 
 export type Filter = 'all' | 'unread' | 'favorites' | 'groups'
-export type Pane = 'search' | 'info' | null
+export type Pane = 'search' | 'info' | 'starred' | null
 
 export interface Toast {
   id: number
@@ -80,6 +80,10 @@ interface State {
   relinkPrompt: boolean
   /** unread count captured when the active chat was opened — survives markRead */
   openUnread: number
+  /** generic destructive-confirm dialog — context menus can't host one */
+  confirm: { title: string; body?: string; ok?: string; run: () => void } | null
+  /** global starred-message list (loaded lazily when the pane opens) */
+  starredList: Message[] | 'loading' | null
 }
 
 let toastId = 0
@@ -94,6 +98,15 @@ const sortChats = (chats: Map<Id, Chat>): Id[] =>
     .map((c) => c.id)
 
 const SETTINGS_KEY = 'quapp.settings.v1'
+const DRAFTS_KEY = 'quapp-drafts'
+
+function loadDrafts(): Map<Id, string> {
+  try {
+    const raw = localStorage.getItem(DRAFTS_KEY)
+    if (raw) return new Map(JSON.parse(raw) as [Id, string][])
+  } catch { /* corrupted */ }
+  return new Map()
+}
 
 function loadSettings(): Settings {
   const base: Settings = {
@@ -146,13 +159,15 @@ export const useStore = create<State>(() => ({
   settingsOpen: false,
   forwarding: null,
   online: new Map(),
-  drafts: new Map(),
+  drafts: loadDrafts(),
   paletteOpen: false,
   qrString: null,
   bridgeStatus: 'idle',
   demoMode: true,
   relinkPrompt: false,
   openUnread: 0,
+  confirm: null,
+  starredList: null,
   settings: loadSettings(),
 }))
 
@@ -300,13 +315,22 @@ function flushEvents() {
     bucketsTouched = true
   }
 
+  // new ids accumulate per chat and merge ONCE at commit — appending
+  // [...b.ids, id] per message was O(n²) in a backfill burst, and blindly
+  // appending scrambled order when replayed rows arrive older than the tail
+  const addedIds = new Map<Id, Id[]>()
   const upsert = (msg: Message, backfill: boolean) => {
     const b = buckets.get(msg.chatId)
     if (b) {
       const map = draft(msg.chatId)!
       const prev = map.get(msg.id)
       map.set(msg.id, { ...msg, v: (prev?.v ?? 0) + 1 })
-      if (!prev) buckets.set(msg.chatId, { ...b, map, ids: [...b.ids, msg.id] })
+      if (!prev) {
+        let a = addedIds.get(msg.chatId)
+        if (!a) addedIds.set(msg.chatId, (a = []))
+        a.push(msg.id)
+        bucketsTouched = true
+      }
     } else {
       buckets.set(msg.chatId, { ids: [msg.id], map: new Map([[msg.id, { ...msg, v: 1 }]]), hasMore: false, loaded: true })
     }
@@ -340,7 +364,8 @@ function flushEvents() {
         const map = draft(e.msg.chatId)
         if (!map) break
         const prev = map.get(e.msg.id)
-        map.set(e.msg.id, { ...prev, ...e.msg, v: (prev?.v ?? 0) + 1 })
+        if (!prev) break // an update for an unloaded message must not create a phantom map-only entry
+        map.set(e.msg.id, { ...prev, ...e.msg, v: prev.v + 1 })
         break
       }
       case 'messages_removed': {
@@ -365,7 +390,12 @@ function flushEvents() {
         break
       }
       case 'chat_update': {
-        chats.set(e.chat.id, e.chat)
+        const prev = chats.get(e.chat.id)
+        // never regress lastActivity — an echo of an older snapshot would
+        // bounce the chat down the list
+        chats.set(e.chat.id, prev && e.chat.lastActivity < prev.lastActivity
+          ? { ...e.chat, lastActivity: prev.lastActivity }
+          : e.chat)
         chatsTouched = true
         break
       }
@@ -396,12 +426,16 @@ function flushEvents() {
         break
       }
       case 'linked': {
-        set({ account: e.account, qrString: null })
+        set({ account: e.account, qrString: null, bridgeStatus: 'ready' })
         if (get().phase === 'linking') scheduleBoot()
         break
       }
       case 'qr': {
         if (get().phase === 'ready') {
+          // clear the local clones too — later events in this same flush would
+          // otherwise commit pre-reset chats/buckets over the wipe
+          chats.clear(); buckets.clear(); drafts.clear()
+          chatsTouched = bucketsTouched = true
           patch({ phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(), activeChat: null })
         }
         set({ qrString: e.qr })
@@ -409,7 +443,11 @@ function flushEvents() {
       }
       case 'connection': {
         if (e.state === 'closed') {
-          set({ bridgeStatus: 'connecting' })
+          // a dead socket leaves typing dots/online/sync banner frozen —
+          // clear the local clones too or the flush commit restores them
+          typing.clear(); typingTouched = true
+          online.clear(); onlineTouched = true
+          set({ bridgeStatus: 'connecting', syncing: null })
           if (get().phase === 'linking') setTimeout(retryBoot, 2500)
         } else if (e.state === 'open' && get().phase === 'ready' && !get().demoMode) {
           scheduleBoot()
@@ -422,10 +460,13 @@ function flushEvents() {
       }
       case 'older_result': {
         const b = buckets.get(e.chatId)
-        if (b) {
-          buckets.set(e.chatId, { ...b, hasMore: e.hasMore })
-          bucketsTouched = true
-        }
+        // seed a bucket for chats outside the snapshot's top-60 — without it
+        // the spinner shows forever and deeper history can never load
+        buckets.set(e.chatId, {
+          ids: b?.ids ?? [], map: b?.map ?? new Map(),
+          hasMore: e.hasMore, loaded: true,
+        })
+        bucketsTouched = true
         break
       }
       case 'profile': {
@@ -453,6 +494,25 @@ function flushEvents() {
   // drafts without rewriting the bucket entry themselves)
   for (const chatId of [...drafts.keys()]) commitDraft(chatId)
 
+  // merge newly-added ids once per touched chat — fast path is a plain append
+  // when every new row is newer than the tail; only out-of-order backfill pays
+  // for a sort
+  for (const [chatId, added] of addedIds) {
+    const b = buckets.get(chatId)
+    if (!b) continue
+    const map = b.map
+    const tailId = b.ids[b.ids.length - 1]
+    const tail = tailId ? map.get(tailId) : undefined
+    let ids: Id[]
+    if (!tail || added.every((id) => (map.get(id)?.ts ?? 0) >= tail.ts)) {
+      ids = [...b.ids, ...added]
+    } else {
+      ids = [...b.ids, ...added]
+      ids.sort((x, y) => (map.get(x)?.ts ?? 0) - (map.get(y)?.ts ?? 0) || (x < y ? -1 : 1))
+    }
+    buckets.set(chatId, { ...b, ids })
+  }
+
   const next: Record<string, unknown> = {}
   if (chatsTouched) { next.chats = chats; next.order = sortChats(chats) }
   if (bucketsTouched) next.buckets = buckets
@@ -470,8 +530,14 @@ function flushEvents() {
 let booting = false
 let offEvents: (() => void) | null = null
 
+let bootRetryQueued = false
 export async function boot(adapter: ClientAdapter) {
-  if (booting) { setTimeout(retryBoot, 400); return }
+  // at most ONE deferred boot — every call while booting used to chain
+  // another 400ms retry forever
+  if (booting) {
+    if (!bootRetryQueued) { bootRetryQueued = true; setTimeout(() => { bootRetryQueued = false; retryBoot() }, 400) }
+    return
+  }
   booting = true
   patch({ adapter, bridgeStatus: 'connecting', demoMode: !!adapter.isDemo })
   offEvents?.() // re-boots (daemon restart) must not double-subscribe events
@@ -479,7 +545,10 @@ export async function boot(adapter: ClientAdapter) {
   offEvents = off
   let snap
   try {
-    snap = await adapter.connect()
+    snap = await Promise.race([
+      adapter.connect(),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 35000)),
+    ])
   } catch {
     off()
     booting = false
@@ -527,15 +596,26 @@ export async function boot(adapter: ClientAdapter) {
   }
   const contacts = new Map(snap.contacts.map((c) => [c.id, c]))
   const order = sortChats(chats)
+  const wasLinking = get().phase === 'linking'
   const current = get().activeChat
-  const first = current && chats.has(current) ? current : (order[0] ?? null)
+  // auto-select the top chat only on the first successful boot — a resync
+  // must not yank the user out of "no chat open" or switch their chat
+  const first = current && chats.has(current) ? current : wasLinking ? (order[0] ?? null) : null
   patch({
     phase: 'ready', account: snap.account, chats, order, buckets, contacts,
     activeChat: first, bridgeStatus: 'ready', qrString: null,
     openUnread: first ? (chats.get(first)?.unread ?? 0) : 0,
   })
   ensureNotifPermission()
-  if (first) adapter.markRead(first)
+  // push user prefs the daemon owns — it boots with defaults until told
+  adapter.prefs?.({
+    autoDlPhotos: get().settings.autoDlPhotos,
+    autoDlDocs: get().settings.autoDlDocs,
+    linkPreviews: get().settings.linkPreviews,
+  })
+  // markRead only on first open — calling it on every resync fires a PDO
+  // tail request per re-boot (the burst that made the phone go silent)
+  if (first && wasLinking) adapter.markRead(first)
   booting = false
   return off
 }
@@ -552,6 +632,9 @@ export function logout() {
     phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(),
     contacts: new Map(), activeChat: null, qrString: null, bridgeStatus: 'connecting',
     selection: null, replyTo: null, editing: null, settingsOpen: false, syncing: null,
+    profiles: new Map(), searchHits: null, typing: new Map(), online: new Map(),
+    pane: null, forwarding: null, flashId: null, paletteOpen: false, confirm: null,
+    drafts: new Map(), starredList: null,
   })
   adapter?.logout()
 }
@@ -561,7 +644,7 @@ export function openChat(chatId: Id) {
   // snapshot the unread count BEFORE markRead zeroes it — the unread divider
   // in MessageList anchors on this value
   const openUnread = chats.get(chatId)?.unread ?? 0
-  patch({ activeChat: chatId, openUnread, replyTo: null, editing: null, selection: null, showArchived: false })
+  patch({ activeChat: chatId, openUnread, replyTo: null, editing: null, selection: null, searchHits: null, showArchived: chats.get(chatId)?.archived ?? false })
   adapter?.markRead(chatId)
 }
 
@@ -581,17 +664,33 @@ export function nextChat(dir: 1 | -1) {
 }
 
 export async function loadOlder(chatId: Id) {
-  const { adapter, buckets } = get()
-  const b = buckets.get(chatId)
-  if (!adapter || !b || !b.hasMore || !b.ids.length) return
-  const first = b.map.get(b.ids[0])
-  if (!first) return
-  const page = await adapter.loadOlder(chatId, first.ts, 60).catch(() => null)
+  const { adapter } = get()
+  if (!adapter) return
+  const b = get().buckets.get(chatId)
+  if (b && !b.hasMore) return
+  const first = b?.ids.length ? b.map.get(b.ids[0]) : undefined
+  // no bucket (chat outside the snapshot's top-60) → page from "now" so the
+  // daemon can answer from disk or phone-fetch with a tail anchor
+  const page = await adapter.loadOlder(chatId, first?.ts ?? Date.now(), 60).catch(() => null)
   if (!page) return 0
+  // re-read AFTER the await — a live message landing mid-fetch must not be
+  // overwritten by the stale bucket captured above
+  const cur = get().buckets.get(chatId)
   const nb = new Map(get().buckets)
-  const map = new Map(b.map)
-  const ids = page.messages.map((m) => { map.set(m.id, { ...m, v: 1 }); return m.id })
-  nb.set(chatId, { ...b, map, ids: [...ids, ...b.ids], hasMore: page.hasMore })
+  const map = new Map(cur?.map ?? [])
+  const old = cur?.ids ?? []
+  const ids: Id[] = []
+  for (const m of page.messages) {
+    if (map.has(m.id)) continue
+    map.set(m.id, { ...m, v: 1 })
+    ids.push(m.id)
+  }
+  const merged = [...ids, ...old]
+  if (merged.length > 1) {
+    const out = merged.some((id, i) => i > 0 && (map.get(id)?.ts ?? 0) < (map.get(merged[i - 1])?.ts ?? 0))
+    if (out) merged.sort((a, b) => (map.get(a)?.ts ?? 0) - (map.get(b)?.ts ?? 0) || (a < b ? -1 : 1))
+  }
+  nb.set(chatId, { ids: merged, map, hasMore: page.hasMore, loaded: true })
   set({ buckets: nb })
   return page.messages.length
 }
@@ -622,12 +721,17 @@ export function send(chatId: Id, content: OutContent) {
   applyEvent({
     type: 'message',
     msg: {
-      id, chatId, from: 'me', ts: Math.floor(Date.now() / 1000),
+      id, chatId, from: 'me', ts: Date.now(),
       delivery: 'pending', replyTo: replyTo ?? undefined,
       content: optimisticContent(content), v: 1,
     },
   })
-  adapter?.send(chatId, content, replyTo ?? undefined, id)
+  const r = adapter?.send(chatId, content, replyTo ?? undefined, id)
+  // a transport-level failure (socket down, bridge dead) never reaches the
+  // daemon — mark the optimistic row failed or it spins pending forever
+  void Promise.resolve(r).catch(() => applyEvent({
+    type: 'delivery', chatId, ids: [id], delivery: 'failed',
+  }))
   patch({ replyTo: null })
 }
 
@@ -688,6 +792,11 @@ export function updateSettings(p: Partial<Settings>) {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(get().settings))
   } catch { /* storage unavailable */ }
+  // daemon-owned prefs — push the ones the bridge actually consumes
+  const a = get().adapter
+  if (a?.prefs && ('autoDlPhotos' in p || 'autoDlDocs' in p || 'linkPreviews' in p)) {
+    a.prefs({ autoDlPhotos: get().settings.autoDlPhotos, autoDlDocs: get().settings.autoDlDocs, linkPreviews: get().settings.linkPreviews })
+  }
 }
 
 export async function searchInChat(chatId: Id, q: string) {
@@ -697,6 +806,7 @@ export async function searchInChat(chatId: Id, q: string) {
     patch({ searchHits: await adapter.searchMessages(chatId, q) })
   } catch {
     patch({ searchHits: [] })
+    toast('Search is unavailable right now', 'error') // a failed search must not masquerade as zero results
   }
 }
 
@@ -755,10 +865,10 @@ export function doForward(toIds: Id[], msgs: Message[]) {
   patch({ forwarding: null, selection: null })
   toast(toIds.length > 1 ? `Forwarded to ${toIds.length} chats` : 'Forwarded', 'check')
 }
-export function doFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', v: boolean) {
+export function doFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', v: boolean, muteMs?: number) {
   const c = get().chats.get(chatId)
   if (c) applyEvent({ type: 'chat_update', chat: { ...c, [flag]: v } })
-  get().adapter?.setChatFlag(chatId, flag, v)
+  get().adapter?.setChatFlag(chatId, flag, v, muteMs)
 }
 export function doMarkUnread(chatId: Id, v: boolean) {
   const c = get().chats.get(chatId)
@@ -798,7 +908,10 @@ export async function openContactChat(contactId: Id) {
   for (const c of chats.values()) {
     if (c.contactId === contactId) { openChat(c.id); return }
   }
-  const chat = await adapter?.openChat(contactId)
+  const chat = await adapter?.openChat(contactId).catch(() => {
+    toast("Couldn't open that chat — try again", 'error')
+    return undefined
+  })
   if (chat) {
     if (!get().chats.has(chat.id)) {
       const nc = new Map(get().chats)
@@ -812,11 +925,61 @@ export function markAllRead() {
   const { adapter, chats } = get()
   for (const c of chats.values()) if (c.unread > 0 || c.markedUnread) adapter?.markRead(c.id)
 }
+
+// ---------- destructive chat ops — confirmed through the global dialog ----------
+export function askConfirm(c: { title: string; body?: string; ok?: string; run: () => void }) {
+  patch({ confirm: c })
+}
+export function closeConfirm() { patch({ confirm: null }) }
+
+export function confirmClearChat(chatId: Id) {
+  const chat = get().chats.get(chatId)
+  askConfirm({
+    title: `Clear "${chat?.title ?? 'chat'}"?`,
+    body: 'All messages will be removed from this chat — on this device and your linked phone. Media stays in your phone gallery.',
+    ok: 'Clear',
+    run: () => get().adapter?.clearChat?.(chatId),
+  })
+}
+
+export function confirmDeleteChat(chatId: Id) {
+  const chat = get().chats.get(chatId)
+  askConfirm({
+    title: `Delete "${chat?.title ?? 'chat'}"?`,
+    body: 'The conversation and all its messages will be deleted — on this device and your linked phone.',
+    ok: 'Delete',
+    run: () => get().adapter?.deleteChat?.(chatId),
+  })
+}
+
+/** global starred list — daemon scan, newest first; null = not loaded yet */
+export async function loadStarred() {
+  patch({ starredList: 'loading' })
+  const msgs = await get().adapter?.starred?.().catch(() => undefined)
+  patch({ starredList: msgs ?? [] })
+}
+
+/** save an attachment through the daemon — lands in Downloads/Quapp */
+export async function doDownload(m: Message) {
+  const r = await get().adapter?.download?.(m.chatId, m.id).catch(() => undefined)
+  if (r?.path) {
+    const file = r.path.split(/[\\/]/).pop()
+    toast(`Saved to Downloads · ${file}`, 'check')
+  } else {
+    toast(r?.error === 'unavailable' ? 'Media is no longer available' : "Couldn't download — try again", 'error')
+  }
+}
+let draftTimer: ReturnType<typeof setTimeout> | null = null
 export function setDraft(chatId: Id, text: string) {
   const d = new Map(get().drafts)
   if (text) d.set(chatId, text)
   else d.delete(chatId)
   set({ drafts: d })
+  // persist debounced — drafts must survive a restart (WhatsApp keeps them)
+  if (draftTimer) clearTimeout(draftTimer)
+  draftTimer = setTimeout(() => {
+    try { localStorage.setItem(DRAFTS_KEY, JSON.stringify([...d])) } catch { /* full */ }
+  }, 400)
 }
 export function setPalette(v: boolean) { patch({ paletteOpen: v }) }
 export function setTypingNotify(chatId: Id, v: boolean) {

@@ -231,19 +231,27 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
     }
   }
 
+  const typingArmed = useRef(false)
   const notifyTyping = () => {
     clearTimeout(typingTimer.current)
-    setTypingNotify(chat.id, true)
-    typingTimer.current = setTimeout(() => setTypingNotify(chat.id, false), 3000)
+    if (!typingArmed.current) {
+      typingArmed.current = true
+      setTypingNotify(chat.id, true) // one frame per 3s window, not per keystroke
+    }
+    typingTimer.current = setTimeout(() => {
+      typingArmed.current = false
+      setTypingNotify(chat.id, false)
+    }, 3000)
   }
 
   const insertEmoji = (e: string) => {
     const ta = taRef.current
-    if (!ta) { setText((t) => t + e); return }
-    const s = ta.selectionStart ?? text.length
-    const nt = text.slice(0, s) + e + text.slice(ta.selectionEnd ?? s)
+    const s = ta?.selectionStart ?? text.length
+    const nt = text.slice(0, s) + e + text.slice(ta?.selectionEnd ?? s)
     setText(nt)
-    requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(s + e.length, s + e.length) })
+    setDraft(chat.id, nt) // the picker path bypassed onChange → drafts lost emoji inserts
+    const caret = s + e.length
+    requestAnimationFrame(() => { ta?.focus(); ta?.setSelectionRange(caret, caret) })
   }
 
   const attach = (kind: 'image' | 'doc') => {
@@ -390,8 +398,11 @@ function RecorderOverlay({ chat, onDone }: { chat: Chat; onDone: () => void }) {
         an.fftSize = 256
         src.connect(an)
         const buf = new Uint8Array(an.frequencyBinCount)
+        const startedAt = Date.now()
         tick = setInterval(() => {
-          setSec((s) => s + 1)
+          // the tick is 220ms — sec must come from the wall clock or the
+          // timer (and the sent duration) runs ~4.5× fast
+          setSec(Math.floor((Date.now() - startedAt) / 1000))
           an.getByteTimeDomainData(buf)
           let peak = 0
           for (const v of buf) peak = Math.max(peak, Math.abs(v - 128))

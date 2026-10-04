@@ -18,11 +18,12 @@
   --red: #ff3b30;
   --orange: #ff9500;
   --tick-read: #53bdeb;
+  --tick-list: #3498db; /* sidebar check — accents retint --tick-read for on-bubble contrast, the list needs its own readable mid-tone */
 
   /* labels */
   --label: #000000;
   --label-2: rgba(60, 60, 67, 0.6);
-  --label-3: rgba(60, 60, 67, 0.33);
+  --label-3: rgba(60, 60, 67, 0.5);
   --label-4: rgba(60, 60, 67, 0.18);
 
   /* fills (quaternary→primary, Apple order) */
@@ -39,6 +40,7 @@
   --sidebar-solid: #f4f4f6;
   --chrome: rgba(249, 249, 251, 0.78);
   --pill: #f7f6f3;
+  --dot-ring: #f4f4f6;
   --separator: rgba(60, 60, 67, 0.1);
   --separator-strong: rgba(60, 60, 67, 0.17);
 
@@ -48,7 +50,7 @@
   --bubble-out-a: #24a2ff;
   --bubble-out-b: #0a6ff5;
   --bubble-meta-in: rgba(0, 0, 0, 0.45);
-  --bubble-meta-out: rgba(255, 255, 255, 0.72);
+  --bubble-meta-out: rgba(255, 255, 255, 0.85);
 
   /* composer / fields */
   --field: #ffffff;
@@ -80,10 +82,11 @@
   --red: #ff453a;
   --orange: #ff9f0a;
   --tick-read: #53bdeb;
+  --tick-list: #53bdeb;
 
   --label: #ffffff;
   --label-2: rgba(235, 235, 245, 0.6);
-  --label-3: rgba(235, 235, 245, 0.33);
+  --label-3: rgba(235, 235, 245, 0.55);
   --label-4: rgba(235, 235, 245, 0.18);
 
   --fill: rgba(120, 120, 128, 0.24);
@@ -98,6 +101,7 @@
   --sidebar-solid: #1e1e20;
   --chrome: rgba(28, 28, 30, 0.72);
   --pill: #1a1a1c;
+  --dot-ring: #1e1e20;
   --separator: rgba(84, 84, 88, 0.32);
   --separator-strong: rgba(84, 84, 88, 0.55);
 
@@ -279,7 +283,10 @@ body {
 .no-drag, .no-drag * { -webkit-app-region: no-drag; }
 /* under real Mica the frame supplies the material — drop the sidebar's own
    paint so the system material shows through; falls back to the window's
-   opaque backgroundColor when the material is unavailable */
+   opaque backgroundColor when the material is unavailable. The BODY paint
+   must also clear — an opaque body would mask the material entirely. */
+body.mica { background: transparent; }
+body.mica { --dot-ring: transparent; } /* no opaque surface to match under mica — let the dot float */
 body.mica .vibrancy {
   background: transparent;
   backdrop-filter: none;
@@ -392,12 +399,16 @@ mark {
 .bubble-in a { color: var(--blue); }
 .bubble-out a { color: #fff; text-decoration: underline; }
 
-/* focus ring — Apple style, only for keyboard */
+/* focus ring — Apple style, only for keyboard. Global default: EVERY
+   interactive element gets it, not just opt-ins — rows, chips, menu items
+   and dialog buttons were all invisible to keyboard users */
 :focus { outline: none; }
-.focus-ring:focus-visible {
+:is(button, [role="button"], [role="option"], [role="listitem"], [role="menuitem"], a, input, textarea, select, [tabindex]):focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: 1px;
-  border-radius: 8px;
+}
+input:focus-visible, textarea:focus-visible {
+  outline-offset: 0;
 }
 
 input[type="text"], input[type="search"], textarea {

@@ -56,7 +56,11 @@ export function SquircleIcon({ icon, color, size = 28 }: { icon: ReactNode; colo
 export function Toasts() {
   const toasts = useStore((s) => s.toasts)
   return (
-    <div className="pointer-events-none fixed bottom-6 left-1/2 z-[90] flex -translate-x-1/2 flex-col items-center gap-2">
+    <div
+      role="status"
+      aria-live="polite"
+      className="pointer-events-none fixed bottom-6 left-1/2 z-[90] flex -translate-x-1/2 flex-col items-center gap-2"
+    >
       <AnimatePresence>
         {toasts.map((t) => (
           <motion.div
@@ -65,12 +69,12 @@ export function Toasts() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 8, scale: 0.97 }}
             transition={spring.pop}
-            className="menu-material flex items-center gap-2 rounded-full px-4 py-2 text-[13px] font-medium"
+            className="menu-material flex max-w-[min(480px,80vw)] items-center gap-2 rounded-full px-4 py-2 text-[13px] font-medium"
           >
-            {t.icon === 'check' && <Check size={15} weight="bold" className="text-[var(--green)]" />}
-            {t.icon === 'error' && <WarningCircle size={15} weight="bold" className="text-[var(--red)]" />}
-            {t.icon === 'info' && <Info size={15} weight="bold" className="text-[var(--blue)]" />}
-            {t.text}
+            {t.icon === 'check' && <Check size={15} weight="bold" className="shrink-0 text-[var(--green)]" />}
+            {t.icon === 'error' && <WarningCircle size={15} weight="bold" className="shrink-0 text-[var(--red)]" />}
+            {t.icon === 'info' && <Info size={15} weight="bold" className="shrink-0 text-[var(--blue)]" />}
+            <span className="truncate">{t.text}</span>
           </motion.div>
         ))}
       </AnimatePresence>
