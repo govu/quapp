@@ -1,13 +1,13 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import {
-  Archive, BellSlash, Checks, Copy, MagnifyingGlass, Phone, PushPin,
+  Archive, ArrowUp, BellSlash, Checks, Copy, MagnifyingGlass, Phone, PushPin,
   Share, Trash, User, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat } from '../bridge/types'
 import { cx, spring } from '../lib/util'
 import {
-  clearSelection, doDelete, doFlag, doMarkUnread, setForwarding, setPane, toast, useStore,
+  clearSelection, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, toast, useStore,
 } from '../store'
 import { Avatar } from './common'
 import { MessageList } from './MessageList'
@@ -24,13 +24,27 @@ export function Conversation() {
   // captured at open-time before markRead zeroed the badge — keeps the
   // "Unread messages" divider anchored
   const openUnread = useStore((s) => s.openUnread)
+  // drag-enter counter — nested children each fire enter/leave, so a bool
+  // flickers; counting stays solid while files are over the chat
+  const [drag, setDrag] = useState(0)
 
   if (!chat || !activeChat) {
     return <EmptyState />
   }
 
   return (
-    <div className="relative flex min-w-0 flex-1 flex-col">
+    <div
+      className="relative flex min-w-0 flex-1 flex-col"
+      onDragEnter={(e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); setDrag((d) => d + 1) } }}
+      onDragLeave={() => setDrag((d) => Math.max(0, d - 1))}
+      onDragOver={(e) => { if (e.dataTransfer.types.includes('Files')) e.preventDefault() }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.files.length) return
+        e.preventDefault()
+        setDrag(0)
+        sendFiles(chat.id, e.dataTransfer.files)
+      }}
+    >
       {selection ? <SelectionBar chat={chat} /> : <Header chat={chat} />}
 
       <div className={cx('relative min-h-0 flex-1', wallClass(wallpaper))}>
@@ -42,6 +56,26 @@ export function Conversation() {
       <AnimatePresence>
         {pane === 'search' && <SearchPane key="sp" chat={chat} />}
         {pane === 'info' && <InfoPane key="ip" chat={chat} />}
+      </AnimatePresence>
+
+      {/* drop target — WhatsApp Web style */}
+      <AnimatePresence>
+        {drag > 0 && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.12 }}
+            className="pointer-events-none absolute inset-0 z-40 grid place-items-center bg-[var(--bg)]/80 p-6 backdrop-blur-sm"
+          >
+            <div className="grid w-full max-w-sm place-items-center gap-3 rounded-[20px] border-2 border-dashed border-[var(--blue)] bg-[var(--blue)]/5 py-10">
+              <span className="grid size-14 place-items-center rounded-full bg-[var(--blue)] text-white">
+                <ArrowUp size={26} weight="bold" />
+              </span>
+              <span className="text-[15px] font-medium">Drop files to send to {chat.title}</span>
+            </div>
+          </motion.div>
+        )}
       </AnimatePresence>
     </div>
   )

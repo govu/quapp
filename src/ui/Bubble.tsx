@@ -582,7 +582,13 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
   prev.id === next.id &&
   prev.ctx.first === next.ctx.first &&
   prev.ctx.last === next.ctx.last &&
-  prev.ctx.chat === next.ctx.chat,
+  // field-level chat compare: a message arriving bumps chat.lastActivity and
+  // hands every visible row a fresh ctx.chat reference — rows only render
+  // id/title/kind, so lastActivity/unread churn must not re-render bubbles
+  prev.ctx.chat.id === next.ctx.chat.id &&
+  prev.ctx.chat.title === next.ctx.chat.title &&
+  prev.ctx.chat.kind === next.ctx.chat.kind &&
+  prev.ctx.chat.pinnedMessageId === next.ctx.chat.pinnedMessageId,
 )
 
 function senderHue(m: Message) {

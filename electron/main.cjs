@@ -6,8 +6,17 @@ const path = require('node:path')
 const isDev = process.argv.includes('--dev') || !app.isPackaged
 const DEV_URL = process.env.QUAPP_DEV_URL || 'http://localhost:5199'
 
-// GPU drivers on VMs/Remote Desktop crash the renderer — software GL is fine for a chat app
-if (process.env.QUAPP_GPU !== '1') app.disableHardwareAcceleration()
+// GPU on by default — Electron auto-falls back to software GL if the GPU
+// process crashes repeatedly (broken VM/RDP drivers); QUAPP_GPU=0 forces
+// software rendering for those environments
+if (process.env.QUAPP_GPU === '0') app.disableHardwareAcceleration()
+
+// keep the renderer live when occluded/minimized — typing indicators,
+// presence and history replay must not throttle; same flags Slack/Discord use
+app.commandLine.appendSwitch('disable-background-timer-throttling')
+app.commandLine.appendSwitch('disable-renderer-backgrounding')
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+app.commandLine.appendSwitch('force_high_performance_gpu')
 
 // single instance — a second launch focuses the open window
 const gotLock = app.requestSingleInstanceLock()

@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useMemo } from 'react'
-import { AnimatePresence } from 'motion/react'
+import { AnimatePresence, MotionConfig } from 'motion/react'
 import { DemoAdapter } from './bridge/demo'
 import { WsAdapter } from './bridge/ws'
 import type { ClientAdapter } from './bridge/types'
@@ -50,6 +50,7 @@ export default function App() {
   const phase = useStore((s) => s.phase)
   const theme = useStore((s) => s.settings.theme)
   const accent = useStore((s) => s.settings.accent)
+  const animLevel = useStore((s) => s.settings.animLevel)
   const forwarding = useStore((s) => s.forwarding)
 
   // theme: system/light/dark — applied instantly, no transition on switch
@@ -68,6 +69,12 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.accent = accent
   }, [accent])
+
+  // animation level — MotionConfig drops transform/layout motion; CSS rule
+  // collapses keyframe anims and transitions app-wide
+  useEffect(() => {
+    document.documentElement.classList.toggle('anim-reduced', animLevel === 'reduced')
+  }, [animLevel])
 
   const adapter = useMemo(makeAdapter, [])
 
@@ -108,26 +115,30 @@ export default function App() {
 
   if (phase === 'linking') {
     return (
-      <div className="h-full">
-        <Onboarding />
-      </div>
+      <MotionConfig reducedMotion={animLevel === 'reduced' ? 'always' : 'user'}>
+        <div className="h-full">
+          <Onboarding />
+        </div>
+      </MotionConfig>
     )
   }
 
   return (
-    <div className="flex h-full overflow-hidden">
-      <Sidebar />
-      <main className="relative flex min-w-0 flex-1 flex-col">
-        <Conversation />
-      </main>
-      <Suspense fallback={null}>
-        <SettingsSheet />
-      </Suspense>
-      <AnimatePresence>{forwarding && <ForwardSheet />}</AnimatePresence>
-      <Palette />
-      <Toasts />
-      <ContextMenuHost />
-      <RelinkPrompt />
-    </div>
+    <MotionConfig reducedMotion={animLevel === 'reduced' ? 'always' : 'user'}>
+      <div className="flex h-full overflow-hidden">
+        <Sidebar />
+        <main className="relative flex min-w-0 flex-1 flex-col">
+          <Conversation />
+        </main>
+        <Suspense fallback={null}>
+          <SettingsSheet />
+        </Suspense>
+        <AnimatePresence>{forwarding && <ForwardSheet />}</AnimatePresence>
+        <Palette />
+        <Toasts />
+        <ContextMenuHost />
+        <RelinkPrompt />
+      </div>
+    </MotionConfig>
   )
 }

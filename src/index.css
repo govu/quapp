@@ -38,6 +38,7 @@
   --sidebar: rgba(244, 244, 246, 0.72);
   --sidebar-solid: #f4f4f6;
   --chrome: rgba(249, 249, 251, 0.78);
+  --pill: #f7f6f3;
   --separator: rgba(60, 60, 67, 0.1);
   --separator-strong: rgba(60, 60, 67, 0.17);
 
@@ -96,6 +97,7 @@
   --sidebar: rgba(30, 30, 32, 0.62);
   --sidebar-solid: #1e1e20;
   --chrome: rgba(28, 28, 30, 0.72);
+  --pill: #1a1a1c;
   --separator: rgba(84, 84, 88, 0.32);
   --separator-strong: rgba(84, 84, 88, 0.55);
 
@@ -300,14 +302,22 @@ body {
 .tail-out { color: var(--bubble-out-b); }
 .tail-in { color: var(--bubble-in); }
 
-/* unread divider + day pill */
+/* unread divider + day pill — solid, not blur: a backdrop-filter per row
+   inside a transformed virtual scroller costs one compositing layer each and
+   glitches on scroll; --pill matches the chrome color blended over the wall */
 .pill {
-  background: var(--chrome);
-  backdrop-filter: blur(16px) saturate(160%);
-  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  background: var(--pill);
   box-shadow:
     0 0 0 0.5px var(--separator),
     0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+/* reduced-motion kill switch — MotionConfig handles transform/layout
+   animations; this collapses every CSS animation/transition */
+.anim-reduced *, .anim-reduced *::before, .anim-reduced *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
 }
 
 /* wallpaper */

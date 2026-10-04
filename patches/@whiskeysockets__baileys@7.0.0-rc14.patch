@@ -1,0 +1,23 @@
+diff --git a/lib/Socket/messages-recv.js b/lib/Socket/messages-recv.js
+index f2003ac00ef223468c432a1bbe0a0eb02c1453b2..e1ad457674c5478726d3648f6394227999debb61 100644
+--- a/lib/Socket/messages-recv.js
++++ b/lib/Socket/messages-recv.js
+@@ -493,6 +493,9 @@ export const makeMessagesRecvSocket = (config) => {
+             if (node.attrs.participant) {
+                 receipt.attrs.participant = node.attrs.participant;
+             }
++            if (node.attrs.category === 'peer') {
++                receipt.attrs.category = 'peer';
++            }
+             if (retryCount > 1 || forceIncludeKeys || shouldRecreateSession) {
+                 const { update, preKeys } = await getNextPreKeys(authState, 1);
+                 const [keyId] = Object.keys(preKeys);
+@@ -1296,7 +1299,7 @@ export const makeMessagesRecvSocket = (config) => {
+                     messageRetryManager.addRecentMessage(msg.key.remoteJid, msg.key.id, msg.message);
+                 }
+                 // message failed to decrypt
+-                if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT && msg.category !== 'peer') {
++                if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
+                     if (msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT) {
+                         acked = true;
+                         return sendMessageAck(node, NACK_REASONS.ParsingError);

@@ -7,7 +7,7 @@ import {
 } from '@phosphor-icons/react'
 import type { Chat } from '../bridge/types'
 import { spring } from '../lib/util'
-import { doEdit, send, setDraft, setEditing, setReplyTo, setTypingNotify, useStore } from '../store'
+import { doEdit, send, sendFiles, setDraft, setEditing, setReplyTo, setTypingNotify, useStore } from '../store'
 import { EMOJI } from '../lib/emoji'
 
 // ---------- emoji picker (native system emoji, compact) ----------
@@ -252,32 +252,7 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
   }
 
   const onFiles = (files: FileList | null) => {
-    for (const f of Array.from(files ?? [])) onFile(f)
-  }
-
-  const onFile = (f: File) => {
-    if (f.size > 256 * 1024 * 1024) { toast(`"${f.name}" is too large (256 MB max)`, 'error'); return }
-    const rd = new FileReader()
-    rd.onload = () => {
-      const url = String(rd.result)
-      if (fileMode.current === 'doc' || !/^(image|video)\//.test(f.type)) {
-        send(chat.id, { kind: 'document', name: f.name, size: f.size, mime: f.type || 'application/octet-stream', url })
-        return
-      }
-      if (f.type.startsWith('video/')) {
-        const v = document.createElement('video')
-        v.preload = 'metadata'
-        v.onloadedmetadata = () => send(chat.id, { kind: 'video', url, w: v.videoWidth, h: v.videoHeight })
-        v.onerror = () => send(chat.id, { kind: 'video', url, w: 0, h: 0 })
-        v.src = url
-        return
-      }
-      const img = new Image()
-      img.onload = () => send(chat.id, { kind: 'image', url, w: img.naturalWidth, h: img.naturalHeight })
-      img.onerror = () => send(chat.id, { kind: 'image', url, w: 0, h: 0 })
-      img.src = url
-    }
-    rd.readAsDataURL(f)
+    if (files?.length) sendFiles(chat.id, files, fileMode.current === 'doc')
   }
 
   if (isChannel) {
@@ -315,6 +290,16 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
             rows={1}
             onChange={(e) => { setText(e.target.value); setDraft(chat.id, e.target.value); notifyTyping() }}
             onKeyDown={onKey}
+            onPaste={(e) => {
+              // pasted files attach like WhatsApp Web — images send as photos,
+              // everything else as a document
+              const files = e.clipboardData?.files
+              if (files?.length) {
+                e.preventDefault()
+                fileMode.current = 'image'
+                onFiles(files)
+              }
+            }}
             placeholder="Message"
             className="w-full resize-none rounded-[18px] border border-[var(--field-border)] bg-[var(--field)] py-[7px] pl-3.5 pr-10 text-[15px] leading-[20px] outline-none placeholder:text-[var(--label-3)] focus:border-[var(--blue)]/50"
             aria-label="Message"

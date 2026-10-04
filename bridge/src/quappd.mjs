@@ -22,6 +22,8 @@ import makeWASocket, {
   isJidBroadcast,
   isJidNewsletter,
   getAggregateVotesInPollMessage,
+  decryptPollVote,
+  getKeyAuthor,
   proto,
 } from '@whiskeysockets/baileys'
 import { WebSocketServer } from 'ws'
@@ -93,12 +95,29 @@ const S = {
 
 // on-demand history state (ZapFast fetch_older/early_events) — declared here
 // because the durable-state restore below populates them at module load
-const pendingOlder = new Map() // chatId -> { asked: ts, explicit: bool }
+const pendingOlder = new Map() // chatId -> { asked: ts, explicit: bool, sid: string }
+const pendingSid = new Map() // peerDataRequestSessionId -> chatId (exact PDO matching)
 const historyStart = new Set() // phone said "nothing older" — never ask again
 const pendingReactions = new Map() // 'chatId:msgId' -> [{by, emoji, ts}]
 const removalPoint = new Map() // chatId -> ts(ms): deleted chats stay deleted
+const rawGroupMeta = new Map() // chatId -> GroupMetadata (cachedGroupMetadata feed)
 const EARLY_MAX = 512
 const PHONE_PATIENCE = 90_000
+
+// Baileys 7 CacheStore shim — a bounded Map with the expected method names
+const lruCache = (max = 5000) => {
+  const m = new Map()
+  return {
+    get: (k) => m.get(k),
+    set: (k, v) => {
+      if (m.has(k)) m.delete(k)
+      else if (m.size >= max) m.delete(m.keys().next().value)
+      m.set(k, v)
+    },
+    del: (k) => m.delete(k),
+    flushAll: () => m.clear(),
+  }
+}
 
 const FLAGS_FILE = path.join(DATA, 'flags.json')
 try {
@@ -190,6 +209,11 @@ const respond = (ws, id, ok, resultOrErr) => {
 const norm = (jid) => jidNormalizedUser(jid ?? '')
 // strip the :device suffix — all chat/participant jids are device-less
 const ownJid = () => (S.me ? S.me.id.split(':')[0] + '@' + S.me.id.split('@')[1] : '')
+// own traffic may arrive under the privacy LID — treat both as "me"
+const isOwnJid = (jid) => {
+  const j = norm(jid)
+  return !!j && (j === ownJid() || (!!S.me?.lid && j === S.me.lid))
+}
 const msgsOf = (chatId) => S.msgs.get(chatId) ?? S.msgs.get(canonicalJid(chatId)) ?? new Map()
 const chatOf = (chatId) => S.chats.get(chatId) ?? S.chats.get(canonicalJid(chatId))
 const sortedMsgs = (chatId) => [...msgsOf(chatId).values()].map((e) => e.model).sort((a, b) => a.ts - b.ts)
@@ -219,11 +243,21 @@ function learnLid(lid, pn) {
 }
 
 // message keys carry LID↔PN pairs (ZapFast learn_source: sender_alt /
-// recipient_alt) — Baileys surfaces them as key.{sender,participant}{Lid,Pn}
+// recipient_alt) — Baileys surfaces them as key.{sender,participant}{Lid,Pn};
+// the chat's own identity pairs as (remoteJid, remoteJidAlt) / (sender*, chat)
 function learnFromKey(key) {
   if (!key) return
-  if (key.senderLid && key.senderPn) learnLid(key.senderLid, key.senderPn)
-  if (key.participantLid && key.participantPn) learnLid(key.participantLid, key.participantPn)
+  const pair = (a, b) => {
+    a = norm(a); b = norm(b)
+    if (a?.endsWith('@lid') && b?.endsWith('@s.whatsapp.net')) learnLid(a, b)
+    else if (b?.endsWith('@lid') && a?.endsWith('@s.whatsapp.net')) learnLid(b, a)
+  }
+  pair(key.senderLid, key.senderPn)
+  pair(key.participantLid, key.participantPn)
+  pair(key.remoteJidAlt, key.remoteJid)
+  pair(key.senderLid, key.remoteJid)
+  pair(key.senderPn, key.remoteJid)
+  pair(key.participantLid, key.remoteJid)
 }
 
 // move a privacy-id chat under its phone number: merge messages, unread,
@@ -265,15 +299,30 @@ function rekeyChat(lid, pn) {
     pendingReactions.delete(k)
     pendingReactions.set(pn + ':' + k.slice(lid.length + 1), q)
   }
+  // every per-chat map follows the rekey — flags, receipts, pending fetches,
+  // "nothing older" knowledge, presence subs, typing timers, tombstones
+  if (S.lastKey.has(lid)) { S.lastKey.set(pn, S.lastKey.get(lid)); S.lastKey.delete(lid) }
+  if (pendingOlder.has(lid)) { pendingOlder.set(pn, pendingOlder.get(lid)); pendingOlder.delete(lid) }
+  if (historyStart.has(lid)) { historyStart.add(pn); historyStart.delete(lid) }
+  for (const f of [S.flags.favorite, S.flags.unread, S.flags.starred]) {
+    if (f.delete(lid)) f.add(pn)
+  }
+  if (S.typingTimers.has(lid)) { S.typingTimers.set(pn, S.typingTimers.get(lid)); S.typingTimers.delete(lid) }
+  if (S.subscribedPresence.has(lid)) { S.subscribedPresence.add(pn); S.subscribedPresence.delete(lid) }
+  if (removalPoint.has(lid)) { removalPoint.set(pn, removalPoint.get(lid)); removalPoint.delete(lid) }
 }
+// official fallback order: saved name → pushname → masked display_name →
+// @username → formatted number — raw lid digits are never a display name
 const displayName = (jid) => {
   jid = norm(jid)
-  if (jid === ownJid()) return 'You'
+  if (isOwnJid(jid)) return 'You'
   const real = resolveJid(jid)
   const c = S.contacts.get(real) ?? S.contacts.get(jid)
   if (c?.name || c?.firstName) return c.name ?? c.firstName
   const pn = S.pushNames.get(real) ?? S.pushNames.get(jid)
   if (pn) return pn
+  if (c?.maskedPhone) return c.maskedPhone
+  if (c?.username) return '@' + c.username
   if (real.endsWith('@lid')) return 'WhatsApp user' // still no mapping
   if (isJidGroup(real)) return 'Group'
   if (isJidNewsletter(real)) return 'Channel'
@@ -281,21 +330,32 @@ const displayName = (jid) => {
 }
 
 function upsertContact(raw) {
-  const jid = norm(raw.id ?? raw.jid ?? raw.lid)
+  const jid = norm(raw.id ?? raw.jid ?? raw.lid ?? raw.phoneNumber)
   if (!jid || jid.includes('@broadcast') || isJidNewsletter(jid)) return
   // Baileys gives { id, lid } pairs — index under both so @lid chats resolve
   const lid = raw.lid ? norm(raw.lid) : null
+  const pn = raw.phoneNumber ? norm(raw.phoneNumber) : null
   if (lid && lid !== jid) {
     learnLid(lid, jid)
     const lc = S.contacts.get(lid) ?? {}
     S.contacts.set(lid, { ...lc, id: lid, linkedJid: jid })
   }
+  // 7.x history contacts carry {id, lid, phoneNumber} — learn the lid→pn edge
+  if (lid && pn && pn !== lid) {
+    learnLid(lid, pn)
+    const lc = S.contacts.get(lid) ?? {}
+    S.contacts.set(lid, { ...lc, id: lid, linkedJid: pn })
+  }
   const prev = S.contacts.get(jid)
   const c = {
     id: jid,
-    name: raw.name ?? raw.verifiedName ?? raw.notify ?? prev?.name ?? displayName(jid),
-    firstName: raw.name?.split(' ')[0],
+    // never persist the display fallback ('+digits'/'WhatsApp user') — a fake
+    // name blocks the pushName upgrade path forever
+    name: raw.name ?? raw.verifiedName ?? raw.notify ?? prev?.name,
+    firstName: raw.name?.split(' ')[0] ?? prev?.firstName,
     about: raw.status ?? prev?.about,
+    username: raw.username ?? prev?.username,
+    maskedPhone: raw.displayName ?? prev?.maskedPhone, // '+1∙∙∙∙∙∙∙∙80' for privacy-hidden members
     phone: jid.endsWith('@s.whatsapp.net') ? '+' + jid.split('@')[0] : undefined,
     avatarHue: hue(jid),
     avatarUrl: prev?.avatarUrl ?? `http://${HOST}:${MEDIA_PORT}/a/${encodeURIComponent(jid)}?token=${TOKEN}`,
@@ -304,7 +364,14 @@ function upsertContact(raw) {
   S.contacts.set(jid, c)
   markDirty()
   // a contact arriving late may resolve a chat titled '+digits'/'WhatsApp user'
-  retitleChats()
+  scheduleRetitle()
+}
+// thousands of contacts landing in one sync must not each trigger an
+// O(chats) scan + emit storm — coalesce into one pass per 500ms
+let retitleTimer = null
+function scheduleRetitle() {
+  if (retitleTimer) return
+  retitleTimer = setTimeout(() => { retitleTimer = null; retitleChats() }, 500)
 }
 function retitleChats() {
   for (const ch of S.chats.values()) {
@@ -324,7 +391,7 @@ function retitleChats() {
 }
 
 function chatKind(jid) {
-  if (jid === ownJid()) return 'saved'
+  if (isOwnJid(jid)) return 'saved'
   if (isJidGroup(jid)) return 'group'
   if (isJidNewsletter(jid)) return 'channel'
   return 'dm'
@@ -342,15 +409,18 @@ function upsertChat(raw) {
     avatarHue: hue(jid),
     avatarUrl: prev?.avatarUrl,
     participants: prev?.participants ?? [],
-    pinned: !!raw.pinned || prev?.pinned || false,
-    muted: muteEnds(raw.muteEndTime) || prev?.muted || false,
-    archived: !!raw.archived || prev?.archived || false,
+    // explicit false must clear the flag; absent must preserve — a stale
+    // chunk can never regress live state (ZapFast: merge, never decrease)
+    pinned: raw.pinned != null ? !!raw.pinned : prev?.pinned ?? false,
+    muted: raw.muteEndTime != null ? muteEnds(raw.muteEndTime) : prev?.muted ?? false,
+    archived: raw.archived != null ? !!raw.archived : prev?.archived ?? false,
     favorite: S.flags.favorite.has(jid),
-    unread: raw.unreadCount ?? prev?.unread ?? 0,
-    markedUnread: !!raw.markedAsUnread || S.flags.unread.has(jid),
-    lastActivity: raw.conversationTimestamp
-      ? Number(raw.conversationTimestamp) * 1000
-      : (prev?.lastActivity ?? lastMsgTs(jid)),
+    unread: Math.max(raw.unreadCount ?? 0, prev?.unread ?? 0),
+    markedUnread: raw.markedAsUnread ?? prev?.markedUnread ?? S.flags.unread.has(jid),
+    lastActivity: Math.max(
+      raw.conversationTimestamp ? Number(raw.conversationTimestamp) * 1000 : 0,
+      prev?.lastActivity ?? lastMsgTs(jid),
+    ),
     draft: prev?.draft,
     pinnedMessageId: prev?.pinnedMessageId,
     ephemeral: !!raw.ephemeralExpiration,
@@ -466,10 +536,10 @@ function toModel(raw) {
   const ctx = inner[type]?.contextInfo
   if (ctx?.isForwarded) model.forwarded = true
   if (ctx?.quotedMessage) {
-    const quotedRaw = { key: { remoteJid: chatId, id: ctx.stanzaId, participant: ctx.participant, fromMe: ctx.participant === ownJid() }, message: ctx.quotedMessage }
+    const quotedRaw = { key: { remoteJid: chatId, id: ctx.stanzaId, participant: ctx.participant, fromMe: isOwnJid(ctx.participant) }, message: ctx.quotedMessage }
     model.replyTo = {
       id: ctx.stanzaId,
-      from: norm(ctx.participant ?? '') === ownJid() ? 'me' : norm(ctx.participant ?? chatId),
+      from: isOwnJid(ctx.participant ?? '') ? 'me' : norm(ctx.participant ?? chatId),
       fromName: displayName(ctx.participant ?? chatId),
       preview: previewOf(quotedRaw),
       kind: 'text',
@@ -495,20 +565,31 @@ function baseModel(raw, chatId, content) {
   }
 }
 
+// real WebMessageInfo.StubType values (WAProto enum) — verified 7.x
 const STUB = {
-  1: 'Group created', 2: 'Group created', 4: 'Group name changed',
-  5: null, 29: 'A participant was added', 30: 'A participant was added',
-  31: 'A participant was removed', 32: 'You were added', 33: 'You were removed',
-  68: null, 69: null, 70: null, 71: 'A participant joined via invite link',
-  74: 'Group icon changed', 123: 'You joined this chat',
+  20: 'Group created',
+  21: 'Group name changed',
+  22: 'Group icon changed',
+  27: 'A participant was added',
+  28: 'A participant was removed',
+  29: 'A participant was promoted to admin',
+  30: 'A participant was demoted',
+  31: 'A participant joined via invite link',
+  32: 'A participant left',
+  33: 'A participant changed their number',
+  39: 'Messages are end-to-end encrypted',
+  40: 'Missed voice call',
+  41: 'Missed video call',
+  45: 'Missed group voice call',
+  46: 'Missed group video call',
+  71: 'A participant joined via invite link',
+  123: 'You joined this chat',
 }
 function stubText(raw) {
-  if (raw.messageStubType === 1 || raw.messageStubType === 2) {
-    const who = raw.messageStubParameters?.[0] === 'non_add' ? 'Group created' : 'Group created'
-    return who
-  }
-  if (STUB[raw.messageStubType] === undefined) return 'System message'
-  return STUB[raw.messageStubType]
+  const t = STUB[raw.messageStubType]
+  if (t === undefined) return 'System message'
+  if (raw.messageStubType === 2) return 'Waiting for this message…' // CIPHERTEXT — undecryptable placeholder
+  return t
 }
 
 function storeRaw(raw, model) {
@@ -537,7 +618,7 @@ function storeRaw(raw, model) {
   if (chat) chat.lastActivity = Math.max(chat.lastActivity, model.ts)
   // learn pushNames from messages — the only name source for @lid contacts
   const sender = canonicalJid(norm(raw.key?.participant ?? raw.key?.remoteJid ?? ''))
-  if (raw.pushName && sender && sender !== ownJid()) {
+  if (raw.pushName && sender && !isOwnJid(sender)) {
     S.pushNames.set(sender, raw.pushName)
     // a DM titled '+'+digits or 'WhatsApp user' upgrades to the real name
     const dc = chatOf(sender)
@@ -548,8 +629,14 @@ function storeRaw(raw, model) {
     const ct = S.contacts.get(sender)
     if (ct && !ct.name) ct.name = raw.pushName
   }
-  // receipts need a key even for messages that only arrived via history
-  if (!raw.key?.fromMe && raw.key) S.lastKey.set(model.chatId, raw.key)
+  // receipts need the NEWEST key — history replay ends on the oldest message,
+  // which would under-cover every newer incoming one
+  if (!raw.key?.fromMe && raw.key) {
+    const prev = S.lastKey.get(model.chatId)
+    if (!prev || Number(raw.messageTimestamp ?? 0) >= Number(prev.messageTimestamp ?? 0)) {
+      S.lastKey.set(model.chatId, { key: raw.key, messageTimestamp: Number(raw.messageTimestamp ?? 0) })
+    }
+  }
 }
 
 // ---------- socket ----------
@@ -573,6 +660,19 @@ async function ensureSocket() {
       generateHighQualityLinkPreview: false,
       shouldSyncHistoryMessage: () => true,
       shouldIgnoreJid: (jid) => isJidBroadcast(jid),
+      // 7.x: retry-resend needs the original message — we keep full protos
+      getMessage: async (key) => {
+        const jid = canonicalJid(norm(key?.remoteJid ?? ''))
+        const entry = S.msgs.get(jid)?.get(key?.id)
+        return entry?.proto?.message
+      },
+      // cached group metadata speeds up sends & avoids redundant iq queries
+      cachedGroupMetadata: async (jid) => rawGroupMeta.get(norm(jid)),
+      // caches Baileys 7 uses for retry/device/placeholder bookkeeping
+      msgRetryCounterCache: lruCache(2000),
+      userDevicesCache: lruCache(5000),
+      placeholderResendCache: lruCache(1000),
+      callOfferCache: lruCache(200),
     })
     S.sock = sock
     // every decoded frame counts — keepalive answers keep this alive, so a
@@ -585,7 +685,7 @@ async function ensureSocket() {
       if (sock !== S.sock) return
       try { fn(...a) } catch (e) { log('event handler failed:', e?.message) }
     }
-    sock.ev.on('creds.update', (...a) => S.authState?.saveCreds?.(...a))
+    sock.ev.on('creds.update', safe((...a) => S.authState?.saveCreds?.(...a)))
     sock.ev.on('connection.update', safe(onConn))
     sock.ev.on('messaging-history.set', safe(onHistory))
     sock.ev.on('chats.upsert', safe((chats) => { for (const c of chats) { const m = upsertChat(c); if (m) emit({ type: 'chat_update', chat: m }) } }))
@@ -610,11 +710,24 @@ async function ensureSocket() {
     sock.ev.on('group-participants.update', safe(({ id, participants, action }) => {
       const jid = norm(id); const chat = chatOf(jid)
       if (!chat) return
-      const who = new Set((participants ?? []).map(norm))
+      // participants arrive as objects {id, phoneNumber?, lid?, admin} —
+      // learning each lid↔pn edge is the main way lid-mode groups resolve
+      const who = new Set()
+      for (const p of participants ?? []) {
+        if (typeof p === 'string') { who.add(canonicalJid(norm(p))); continue }
+        const pn = p.phoneNumber ?? p.jid ?? null
+        if (p.lid && pn) learnLid(p.lid, pn)
+        who.add(canonicalJid(norm(pn ?? p.id ?? '')))
+      }
       if (action === 'remove') chat.participants = chat.participants.filter((p) => !who.has(p))
       else if (action === 'add') chat.participants = [...new Set([...chat.participants, ...who])]
       else { S.metaQueued.delete(jid); queueGroupMeta(jid); return } // promote/demote/etc → refetch
       emit({ type: 'chat_update', chat })
+    }))
+    // 7.x: live LID↔PN resolutions between syncs — payload is a single
+    // LIDMapping {lid, pn} (Types/Events.d.ts), not a list
+    sock.ev.on('lid-mapping.update', safe((m) => {
+      if (m?.lid && m?.pn) learnLid(m.lid, m.pn)
     }))
     log('socket started, protocol', version.join('.'))
   } catch (e) {
@@ -630,19 +743,23 @@ function applyGroupMeta(md) {
   const jid = norm(md.id)
   const chat = chatOf(jid) ?? upsertChat({ id: jid })
   if (!chat) return
+  rawGroupMeta.set(jid, md)
   if (md.subject) chat.title = md.subject
   if (md.participants?.length) {
-    // jid = real number, id = whatever the group addresses (lid-mode groups → @lid)
-    chat.participants = md.participants.map((p) => norm(p.jid ?? p.id))
-    const me = ownJid()
-    chat.youAdmin = md.participants.some((p) => (norm(p.jid ?? p.id) === me || norm(p.id) === me) && !!p.admin)
+    // prefer phoneNumber (real PN) — in lid-mode groups `jid`/`id` can be the
+    // @lid; display_name carries the masked number for privacy-hidden members
+    chat.participants = md.participants.map((p) => canonicalJid(norm(p.phoneNumber ?? p.jid ?? p.id)))
+    chat.youAdmin = md.participants.some((p) => (isOwnJid(p.phoneNumber ?? p.jid ?? p.id) || isOwnJid(p.lid)) && !!p.admin)
   }
   if (md.ephemeralDuration) chat.ephemeral = true
   emit({ type: 'chat_update', chat })
   for (const p of md.participants ?? []) {
-    // participants carry both identities — {id: as-sent, jid: pn, lid: @lid}
-    if (p.lid && p.jid) learnLid(p.lid, p.jid)
-    upsertContact({ id: p.jid ?? p.id })
+    // {id: as-addressed, jid: pn|as-addressed, lid: @lid, phoneNumber: pn, displayName: masked}
+    const pn = p.phoneNumber ?? p.jid ?? null
+    if (p.lid && pn) learnLid(p.lid, pn)
+    if (p.id?.endsWith?.('@lid') && pn) learnLid(p.id, pn)
+    const cj = canonicalJid(norm(pn ?? p.id ?? ''))
+    if (cj) upsertContact({ id: cj, displayName: p.displayName })
   }
   // once the LID map grows, unresolved chat titles may now resolve — emit updates
   retitleChats()
@@ -656,7 +773,12 @@ function onConn({ connection, lastDisconnect, qr }) {
     S.lastQr = null
     const u = S.sock.user
     const devId = norm(u.id)
-    S.me = { id: devId.split(':')[0] + '@' + devId.split('@')[1], name: u.name ?? 'Me', phone: '+' + devId.split(':')[0] }
+    S.me = {
+      id: devId.split(':')[0] + '@' + devId.split('@')[1],
+      name: u.name ?? 'Me',
+      phone: '+' + devId.split(':')[0],
+      lid: u.lid ? norm(u.lid) : undefined,
+    }
     emit({ type: 'linked', account: snapshot().account })
     log('linked as', S.me.name)
     // resolve early if history already arrived or shortly after
@@ -673,7 +795,10 @@ function onConn({ connection, lastDisconnect, qr }) {
         log('no history received — full app-state resync')
         void (async () => {
           try {
-            await S.authState?.state?.keys?.set?.({
+            // write through the socket's wrapped keys (tx → cache → disk) —
+            // the raw state.keys bypasses the cacheable wrapper the socket
+            // actually reads, making the reset a silent no-op
+            await S.sock?.authState?.keys?.set?.({
               'app-state-sync-version': { regular_high: null, regular_low: null, regular: null, critical_unblock_low: null, critical_block: null },
             })
             await S.sock?.resyncAppState?.(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)
@@ -717,6 +842,10 @@ function onConn({ connection, lastDisconnect, qr }) {
   }
   if (connection === 'close') {
     S.open = false
+    // presence subscriptions die with the socket — resubscribe on open
+    S.subscribedPresence.clear()
+    for (const m of S.typingTimers.values()) for (const { t } of m.values()) clearTimeout(t)
+    S.typingTimers.clear()
     const code = lastDisconnect?.error?.output?.statusCode
     const detail = lastDisconnect?.error?.output?.payload?.error ?? lastDisconnect?.error?.message ?? ''
     if (code === DisconnectReason.loggedOut) {
@@ -725,11 +854,9 @@ function onConn({ connection, lastDisconnect, qr }) {
       S.historyDone = false
       readyEmitted = false
       syncEndEmitted = false
-      S.authState = null // in-memory creds are dead too — never reuse them
       S.chats.clear(); S.msgs.clear(); S.contacts.clear()
       S.lidToPn.clear(); S.pushNames.clear()
-      stateDirty = false
-      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.rmSync(STATE_FILE, { force: true }); fs.rmSync(MEDIA_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch { /* retried on next boot */ }
+      wipeAuthDirs()
     } else {
       log(`connection closed (${code ?? '?'}) ${detail} — reconnecting`)
     }
@@ -738,6 +865,26 @@ function onConn({ connection, lastDisconnect, qr }) {
     S.backoff = Math.min((S.backoff ?? 2000) * 2, 30000)
     setTimeout(ensureSocket, code === DisconnectReason.loggedOut ? 500 : S.backoff)
   }
+}
+
+// rename-then-delete: a pending keys.set writeFile can land AFTER rmSync and
+// resurrect the old device (the zombie-session Bad MAC flood). Renaming first
+// makes late writes land in the tombstone dir, then it's deleted — and on
+// Windows rmSync on open handles can fail partially, leaving files behind.
+function wipeAuthDirs() {
+  S.authState = null // in-memory creds are dead too — never reuse them
+  stateDirty = false
+  for (const dir of [AUTH_DIR, MEDIA_DIR]) {
+    try {
+      const tmp = `${dir}.stale-${Date.now()}`
+      fs.renameSync(dir, tmp)
+      fs.rmSync(tmp, { recursive: true, force: true })
+    } catch {
+      try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* retried next boot */ }
+    }
+  }
+  try { fs.rmSync(STATE_FILE, { force: true }) } catch { /* next boot */ }
+  try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch { /* next boot */ }
 }
 
 // silence watchdog (ZapFast SILENCE_LIMIT=120s): WhatsApp's keepalive pings
@@ -760,8 +907,11 @@ function maybeReady() {
   for (const w of waiters) w()
 }
 
-function onHistory({ chats, contacts, messages, syncType, isLatest, progress, peerDataRequestSessionId }) {
+function onHistory({ chats, contacts, messages, syncType, isLatest, progress, peerDataRequestSessionId, lidPnMappings }) {
   S.historySeen = true
+  // 7.x: history carries authoritative LID↔PN pairs (also auto-stored in
+  // the signal repo) — feed them into our display map for names/numbers
+  for (const m of lidPnMappings ?? []) if (m.lid && m.pn) learnLid(m.lid, m.pn)
   // ON_DEMAND answers pending fetchMessageHistory requests (ZapFast:
   // sync_type == ON_DEMAND || peer_data_request_session_id.is_some())
   const onDemand = syncType === 6 || peerDataRequestSessionId != null
@@ -776,7 +926,14 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
     const chatTs = c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : 0
     if (through && chatTs <= through && !S.chats.has(jid)) continue
     upsertChat(c)
+    // learn chat-level LID edges the history conversation carries
+    if (c.lidJid && c.pnJid) learnLid(c.lidJid, c.pnJid)
+    else if (jid.endsWith('@lid') && c.pnJid) learnLid(jid, c.pnJid)
+    else if (jid.endsWith('@s.whatsapp.net') && c.lidJid) learnLid(c.lidJid, jid)
     if (c.endOfHistoryTransferType != null) chatMore.set(jid, c.endOfHistoryTransferType)
+    // 1=COMPLETE_AND_NO_MORE, 3=on-demand complete but no access — the phone
+    // has nothing older either way; never ask again (ZapFast history_start)
+    if (c.endOfHistoryTransferType === 1 || c.endOfHistoryTransferType === 3) historyStart.add(jid)
   }
   const arr = Array.isArray(messages) ? messages : Object.values(messages ?? {})
   let n = 0
@@ -788,7 +945,12 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
     if (t === 'reactionMessage') { applyReaction(raw, inner.reactionMessage); continue }
-    if (t === 'pollUpdateMessage') { void applyPollUpdate(raw, inner.pollUpdateMessage); continue }
+    if (t === 'pollUpdateMessage') {
+      // 7.x decrypts the vote internally and re-emits it via messages.update
+      // ({key:creationMsgKey, pollUpdates:[{vote,...}]}) — raw row never renders
+      storePollUpdate(raw, inner.pollUpdateMessage)
+      continue
+    }
     if (t === 'protocolMessage') {
       const p = inner.protocolMessage
       if (p?.type === 14 && p.editedMessage) applyEdit(raw, p)
@@ -810,6 +972,15 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
   if (!onDemand && (isLatest || syncType === 0 || syncType === 7)) S.historyDone = true
   log(`history sync type=${syncType} latest=${!!isLatest} progress=${progress ?? '-'}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
   if (onDemand) {
+    // exact match when the phone echoes our request session id — the filed
+    // chat may differ from the requested jid (e.g. lid canonicalized to pn)
+    if (peerDataRequestSessionId != null) {
+      const wanted = pendingSid.get(peerDataRequestSessionId)
+      if (wanted && !filed.has(wanted) && !chatMore.has(wanted)) {
+        filed.set(wanted, 0); chatMore.set(wanted, undefined)
+      }
+      pendingSid.delete(peerDataRequestSessionId)
+    }
     const counts = new Map(filed)
     for (const jid of chatMore.keys()) if (!counts.has(jid)) counts.set(jid, 0)
     answerOlder([...counts.entries()].map(([jid, count]) => [jid, count, chatMore.get(jid)]))
@@ -853,7 +1024,12 @@ function onMessages({ messages, type }) {
     const t = inner && getContentType(inner)
 
     if (t === 'reactionMessage') { applyReaction(raw, inner.reactionMessage); continue }
-    if (t === 'pollUpdateMessage') { void applyPollUpdate(raw, inner.pollUpdateMessage); continue }
+    if (t === 'pollUpdateMessage') {
+      // 7.x decrypts the vote internally and re-emits it via messages.update
+      // ({key:creationMsgKey, pollUpdates:[{vote,...}]}) — raw row never renders
+      storePollUpdate(raw, inner.pollUpdateMessage)
+      continue
+    }
     if (t === 'protocolMessage') {
       const p = inner.protocolMessage
       if (p?.type === 14 && p.editedMessage) applyEdit(raw, p) // MESSAGE_EDIT
@@ -872,11 +1048,18 @@ function onMessages({ messages, type }) {
     }
     const isNewChat = !S.chats.has(jid)
     if (isNewChat) upsertChat({ id: jid })
+    const isNewMsg = !msgsOf(jid).has(model.id)
     storeRaw(raw, model)
 
     const chat = chatOf(jid)
     if (type === 'notify') {
-      if (chat) { chat.unread = model.from === 'me' ? chat.unread : chat.unread + 1; chat.lastActivity = model.ts }
+      if (chat) {
+        // re-deliveries after a reconnect must not double-count; a fromMe
+        // echo means the phone already read the chat — clear it (ZapFast)
+        if (isNewMsg && model.from !== 'me') chat.unread += 1
+        if (model.from === 'me') chat.unread = 0
+        chat.lastActivity = Math.max(chat.lastActivity, model.ts)
+      }
       emit({ type: 'message', msg: model })
       if (chat) emit({ type: 'chat_update', chat })
     } else {
@@ -914,23 +1097,52 @@ function applyReaction(raw, r) {
   emit({ type: 'message_update', msg: entry.model })
 }
 
-async function applyPollUpdate(raw, p) {
+// A pollUpdateMessage carries {pollUpdateMessageKey (the CREATION key), vote}.
+// From history the vote is still encrypted — decrypt with the poll's own
+// messageSecret (same recipe process-message.js uses); from live traffic the
+// update arrives pre-decrypted via messages.update.
+async function storePollUpdate(raw, p) {
   const chatId = canonicalJid(norm(raw.key.remoteJid))
-  const entry = msgsOf(chatId).get(p.pollCreationMessageKey?.id)
+  const creationKey = p.pollUpdateMessageKey
+  const entry = msgsOf(canonicalJid(norm(creationKey?.remoteJid ?? chatId))).get(creationKey?.id)
   if (!entry || entry.model.content.kind !== 'poll') return
+  entry.pollUpdates ??= []
+  let vote = p.vote
+  if (vote?.encPayload && entry.proto.message?.messageContextInfo?.messageSecret) {
+    try {
+      const meId = ownJid()
+      vote = decryptPollVote(vote, {
+        pollEncKey: entry.proto.message.messageContextInfo.messageSecret,
+        pollCreatorJid: getKeyAuthor(creationKey, meId),
+        pollMsgId: creationKey.id,
+        voterJid: getKeyAuthor(raw.key, meId),
+      })
+    } catch { /* undecryptable vote — skip */ return }
+  }
+  if (!vote) return
+  entry.pollUpdates.push({
+    pollUpdateMessageKey: raw.key,
+    vote,
+    senderTimestampMs: p.senderTimestampMs,
+  })
+  await aggregatePollVotes(entry)
+}
+
+async function aggregatePollVotes(entry) {
   try {
-    // aggregate over ALL update messages seen so far — each update replaces a
-    // voter's prior selection, never adds to it
-    entry.pollUpdates ??= []
-    entry.pollUpdates.push(raw)
-    const votes = await getAggregateVotesInPollMessage({ message: entry.proto, pollUpdates: entry.pollUpdates }, ownJid())
+    // aggregate over ALL decrypted updates — each replaces a voter's prior
+    // selection, never adds to it
+    const votes = await getAggregateVotesInPollMessage(
+      { message: entry.proto.message, pollUpdates: entry.pollUpdates },
+      ownJid(),
+    )
     for (const o of entry.model.content.options) o.votes = 0
     for (const v of votes ?? []) {
       const i = entry.model.content.options.findIndex((o) => o.text === v.name)
       if (i >= 0) entry.model.content.options[i].votes = v.voters?.length ?? 0
     }
     emit({ type: 'message_update', msg: entry.model })
-  } catch { /* undecryptable vote — ignore */ }
+  } catch { /* keep last tallies */ }
 }
 
 function applyEdit(raw, p) {
@@ -958,7 +1170,13 @@ function onMessagesUpdate(updates) {
     if (update?.message?.protocolMessage?.type === 14) { applyEdit({ key }, update.message.protocolMessage); continue }
     if (update?.message?.protocolMessage?.type === 0) { applyRevoke(chatId, update.message.protocolMessage.key?.id); continue }
     if (update?.pollUpdates?.length) {
-      for (const pu of update.pollUpdates) void applyPollUpdate({ key: { remoteJid: chatId, participant: key.participant } }, pu)
+      // key IS the poll-creation message key; items are already decrypted
+      const entry = msgsOf(chatId).get(key.id)
+      if (entry?.model.content.kind === 'poll') {
+        entry.pollUpdates ??= []
+        entry.pollUpdates.push(...update.pollUpdates)
+        void aggregatePollVotes(entry)
+      }
       continue
     }
     if (update?.starred != null) {
@@ -978,9 +1196,20 @@ function onMessagesUpdate(updates) {
 }
 
 function onMessagesDelete(del) {
+  // payload union: {keys:[]} for delete-for-me, or {jid, all:true} for clear-chat
+  if (del.all && del.jid) {
+    const chatId = canonicalJid(norm(del.jid))
+    S.msgs.delete(chatId)
+    const chat = chatOf(chatId)
+    if (chat) { chat.lastActivity = lastMsgTs(chatId) }
+    emit({ type: 'chat_cleared', chatId })
+    if (chat) emit({ type: 'chat_update', chat })
+    markDirty()
+    return
+  }
   // WhatsApp shows "This message was deleted" placeholders — tombstone, not removal
   for (const key of del.keys ?? []) {
-    const chatId = norm(key.remoteJid)
+    const chatId = canonicalJid(norm(key.remoteJid))
     const entry = msgsOf(chatId).get(key.id)
     if (entry) {
       entry.model.content = { kind: 'deleted' }
@@ -991,8 +1220,9 @@ function onMessagesDelete(del) {
 }
 
 function onPresence({ id, presences }) {
-  const chatId = norm(id)
-  for (const [pjid, p] of Object.entries(presences ?? {})) {
+  const chatId = canonicalJid(norm(id))
+  for (const [rawPjid, p] of Object.entries(presences ?? {})) {
+    const pjid = canonicalJid(norm(rawPjid))
     const state = p.lastKnownPresence
     if (state === 'composing' || state === 'recording') {
       let m = S.typingTimers.get(chatId)
@@ -1047,6 +1277,7 @@ function queueGroupMeta(jid, attempt = 0) {
     try {
       applyGroupMeta(await S.sock.groupMetadata(jid))
       metaRetry.delete(jid)
+      S.metaQueued.delete(jid) // release — a later refetch must be allowed
     } catch (e) {
       const tries = (metaRetry.get(jid) ?? 0) + 1
       metaRetry.set(jid, tries)
@@ -1107,8 +1338,13 @@ async function requestHistory(chatId, count = 80, explicit = false) {
   const ts = oldest ? Number(oldest.proto.messageTimestamp) : Math.floor(Date.now() / 1000)
   pendingOlder.set(jid, { asked: Date.now(), explicit })
   try {
-    await S.sock.fetchMessageHistory(count, key, ts)
-    log(`history request ${jid === chatId ? '' : '(lid→pn) '}sent (${count} msgs, anchor ${key.id || 'present'})`)
+    // fetchMessageHistory returns the PDO request session id — the phone
+    // echoes it on the ON_DEMAND chunk, so we can match exactly which chat
+    // a response belongs to (7.x emits peerDataRequestSessionId)
+    const sid = await S.sock.fetchMessageHistory(count, key, ts)
+    const pending = pendingOlder.get(jid)
+    if (pending && typeof sid === 'string') { pending.sid = sid; pendingSid.set(sid, jid) }
+    log(`history request ${jid === chatId ? '' : '(lid→pn) '}sent (${count} msgs, anchor ${key.id || 'present'}${sid ? `, sid ${sid.slice(0, 8)}…` : ''})`)
     return true
   } catch (e) {
     pendingOlder.delete(jid)
@@ -1120,9 +1356,11 @@ async function requestHistory(chatId, count = 80, explicit = false) {
 // ON_DEMAND chunks resolve pending requests (ZapFast answer_older)
 function answerOlder(fileCounts) {
   for (const [jid, n, moreOnPhone] of fileCounts) {
-    if (moreOnPhone === 1) historyStart.add(jid) // COMPLETE_AND_NO_MORE...
+    if (moreOnPhone === 1 || moreOnPhone === 3) historyStart.add(jid) // no more / no access
+    const req = pendingOlder.get(jid)
+    if (req?.sid) pendingSid.delete(req.sid)
     pendingOlder.delete(jid)
-    emit({ type: 'older_result', chatId: jid, count: n, hasMore: n > 0 && moreOnPhone !== 1 })
+    emit({ type: 'older_result', chatId: jid, count: n, hasMore: n > 0 && moreOnPhone !== 1 && moreOnPhone !== 3 })
   }
 }
 
@@ -1132,6 +1370,7 @@ setInterval(() => {
   for (const [jid, req] of pendingOlder) {
     if (now - req.asked < PHONE_PATIENCE) continue
     pendingOlder.delete(jid)
+    if (req.sid) pendingSid.delete(req.sid)
     emit({ type: 'older_result', chatId: jid, count: 0, hasMore: true })
   }
 }, 15000)
@@ -1170,28 +1409,29 @@ const CMDS = {
 
   async logout() {
     log('logout requested')
-    try { await S.sock?.logout() } catch (e) { log('logout call failed:', e?.message) }
+    const dead = S.sock
+    S.sock = null // safe() handler guard: events from the dying socket are dropped
+    try { await dead?.logout() } catch (e) { log('logout call failed:', e?.message) }
     // wipe regardless — the user asked to unpair this device
     S.me = null
     S.historyDone = false
     readyEmitted = false
     syncEndEmitted = false
     pendingOlder.clear()
+    pendingSid.clear()
     historyStart.clear()
     pendingReactions.clear()
+    rawGroupMeta.clear()
     S.subscribedPresence.clear()
     S.typingTimers.clear()
     S.chats.clear(); S.msgs.clear(); S.contacts.clear()
     S.flags.favorite.clear(); S.flags.unread.clear(); S.flags.starred.clear(); saveFlags()
     S.lidToPn.clear(); S.pushNames.clear()
-    S.authState = null
-    try { S.sock?.end?.(undefined) } catch { /* already closed */ }
-    S.sock = null
-    stateDirty = false
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-    fs.rmSync(STATE_FILE, { force: true })
-    fs.rmSync(MEDIA_DIR, { recursive: true, force: true })
-    fs.mkdirSync(AUTH_DIR, { recursive: true })
+    // kill the dying socket's listeners so a late creds.update can't write
+    // into the wiped dir (zombie-session resurrection → Bad MAC flood)
+    try { dead?.ev?.removeAllListeners?.() } catch { /* already torn down */ }
+    try { dead?.end?.(undefined) } catch { /* already closed */ }
+    wipeAuthDirs()
     setTimeout(ensureSocket, 400) // fresh socket → new QR
     return { ok: true }
   },
@@ -1225,19 +1465,27 @@ const CMDS = {
     return out.sort((a, b) => b.ts - a.ts).slice(0, 80)
   },
 
-  async send({ chatId, content, replyTo }) {
+  async send({ chatId, content, replyTo, clientId }) {
     const jid = norm(chatId)
     const payload = await outPayload(content)
     if (!payload) return
     const opts = {}
+    if (clientId) opts.messageId = clientId // echo reconciles the optimistic row
     if (replyTo) {
       const quoted = msgsOf(chatId).get(replyTo.id)?.proto
       if (quoted) opts.quoted = quoted
     }
-    const sent = await S.sock.sendMessage(jid, payload, opts)
+    let sent
+    try {
+      sent = await S.sock.sendMessage(jid, payload, opts)
+    } catch (e) {
+      log('send failed:', e?.message)
+      if (clientId) emit({ type: 'delivery', chatId, ids: [clientId], delivery: 'failed' })
+      throw e
+    }
     if (sent) {
       const model = toModel(sent) ?? baseModel(sent, jid, { kind: 'text', text: '' })
-      model.delivery = 'pending'
+      model.delivery = 'sent'
       storeRaw(sent, model)
       const chat = chatOf(jid)
       if (chat) { chat.lastActivity = model.ts; emit({ type: 'chat_update', chat }) }
@@ -1261,15 +1509,27 @@ const CMDS = {
     for (const id of messageIds) {
       const key = findKey(chatId, id)
       if (forEveryone && key) {
-        try { await S.sock.sendMessage(norm(chatId), { delete: key }) } catch { /* revoked server-side anyway */ }
-        const entry = msgsOf(chatId).get(id)
-        if (entry) {
-          entry.model.content = { kind: 'deleted' }
-          entry.model.reactions = undefined
-          emit({ type: 'message_update', msg: entry.model })
-        }
+        // only tombstone if WhatsApp accepted the revoke — a failed send must
+        // not pretend the message was deleted for everyone
+        try {
+          await S.sock.sendMessage(norm(chatId), { delete: key })
+          const entry = msgsOf(chatId).get(id)
+          if (entry) {
+            entry.model.content = { kind: 'deleted' }
+            entry.model.reactions = undefined
+            emit({ type: 'message_update', msg: entry.model })
+          }
+        } catch (e) { log('revoke failed:', e?.message) }
       } else {
-        // delete-for-me: WhatsApp removes the row entirely
+        // delete-for-me: local row removal + server-side deleteForMe so the
+        // message doesn't resurrect on the next history replay
+        if (key) {
+          try {
+            await S.sock.chatModify({
+              deleteForMe: { deleteMedia: false, key, timestamp: Math.floor(Date.now() / 1000) },
+            }, canonicalJid(norm(chatId)))
+          } catch { /* local delete still stands */ }
+        }
         msgsOf(chatId).delete(id)
         emit({ type: 'messages_removed', chatId, ids: [id] })
       }
@@ -1336,11 +1596,11 @@ const CMDS = {
   },
 
   async markRead({ chatId }) {
-    const key = S.lastKey.get(chatId)
-    if (key) { try { await S.sock.readMessages([key]) } catch { /* receipt best-effort */ } }
+    const last = S.lastKey.get(chatId) ?? S.lastKey.get(canonicalJid(norm(chatId)))
+    if (last?.key) { try { await S.sock.readMessages([last.key]) } catch { /* receipt best-effort */ } }
     // presence subscribe once per session per direct chat — the UI calls
     // markRead on every open, so this is the reliable hook point
-    const jid = norm(chatId)
+    const jid = canonicalJid(norm(chatId))
     if (!jid.endsWith('@g.us') && !S.subscribedPresence.has(jid)) {
       S.subscribedPresence.add(jid)
       void S.sock?.presenceSubscribe(jid).catch(() => {})
@@ -1349,6 +1609,7 @@ const CMDS = {
     if (chat) {
       chat.unread = 0
       chat.markedUnread = false
+      S.flags.unread.delete(chat.id)
       S.flags.unread.delete(chatId)
       saveFlags()
       emit({ type: 'chat_update', chat })

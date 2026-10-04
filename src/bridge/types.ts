@@ -128,6 +128,7 @@ export type ServerEvent =
   | { type: 'delivery'; chatId: Id; ids: Id[]; delivery: Delivery }
   | { type: 'chat_update'; chat: Chat }
   | { type: 'chat_removed'; chatId: Id }
+  | { type: 'chat_cleared'; chatId: Id }
   | { type: 'typing'; chatId: Id; names: string[] }
   | { type: 'linked'; account: Account }
   | { type: 'presence'; chatId: Id; online: boolean; lastSeen?: number }
@@ -158,7 +159,7 @@ export interface ClientAdapter {
   connect(): Promise<Snapshot>
   loadOlder(chatId: Id, beforeTs: number, limit: number): Promise<MessagePage>
   searchMessages(chatId: Id, query: string): Promise<Message[]>
-  send(chatId: Id, content: OutContent, replyTo?: ReplyRef): void
+  send(chatId: Id, content: OutContent, replyTo?: ReplyRef, clientId?: Id): void
   edit(chatId: Id, messageId: Id, text: string): void
   delete(chatId: Id, messageIds: Id[], forEveryone: boolean): void
   react(chatId: Id, messageId: Id, emoji: string | null): void

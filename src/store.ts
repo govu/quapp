@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type {
-  Account, Chat, ClientAdapter, Contact, Id, Message, OutContent, ReplyRef, ServerEvent,
+  Account, Chat, ClientAdapter, Contact, Id, Message, MsgContent, OutContent, ReplyRef, ServerEvent,
 } from './bridge/types'
 
 export type Filter = 'all' | 'unread' | 'favorites' | 'groups'
@@ -230,180 +230,221 @@ useStore.subscribe((s, prev) => {
 })
 
 // ---------- event application ----------
+//
+// The daemon can emit thousands of events per second during history replay.
+// Applying each one through set() cloned every bucket+chat map per message
+// (O(n²)) and re-rendered the whole chat list per event. Events now queue
+// and flush once per macrotask: draft maps are cloned lazily once per
+// touched chat and committed in a single set() — ZapFast's "event-driven,
+// coalesce per frame" model.
 
-function upsertMessage(msg: Message, backfill = false) {
-  const { buckets, chats } = get()
-  const b = buckets.get(msg.chatId)
-  if (b) {
-    const map = new Map(b.map)
-    const prev = map.get(msg.id)
-    map.set(msg.id, { ...msg, v: (prev?.v ?? 0) + 1 })
-    const ids = prev ? b.ids : [...b.ids, msg.id]
-    const nb = { ...b, map, ids }
-    const nbuckets = new Map(buckets)
-    nbuckets.set(msg.chatId, nb)
-    set({ buckets: nbuckets })
-  } else {
-    const nbuckets = new Map(buckets)
-    nbuckets.set(msg.chatId, { ids: [msg.id], map: new Map([[msg.id, { ...msg, v: 1 }]]), hasMore: false, loaded: true })
-    set({ buckets: nbuckets })
-  }
-  if (!chats.get(msg.chatId)) {
-    // message for a chat the snapshot never sent — create a placeholder row;
-    // the daemon's chat_update will fill in name/avatar when meta lands
-    const isGroup = msg.chatId.endsWith('@g.us')
-    const c0: Chat = {
-      id: msg.chatId, kind: isGroup ? 'group' : 'dm', title: msg.chatId.split('@')[0],
-      avatarHue: Math.abs([...msg.chatId].reduce((a, c) => a + c.charCodeAt(0), 0)) % 360,
-      participants: [], pinned: false, muted: false, archived: false, favorite: false,
-      unread: 0, markedUnread: false, lastActivity: msg.ts,
-    }
-    const nc = new Map(chats)
-    nc.set(msg.chatId, c0)
-    set({ chats: nc, order: sortChats(nc) })
-  }
-  const c = useStore.getState().chats.get(msg.chatId)
-  if (c && msg.ts >= c.lastActivity) {
-    const nc = new Map(chats)
-    const isActive = get().activeChat === msg.chatId
-    const inc = msg.from !== 'me' && !isActive && !backfill ? 1 : 0
-    nc.set(msg.chatId, { ...c, lastActivity: msg.ts, unread: c.unread + inc })
-    set({ chats: nc, order: sortChats(nc) })
-  }
-}
-
-function updateMessage(msg: Message) {
-  const { buckets } = get()
-  const b = buckets.get(msg.chatId)
-  if (!b) return
-  const prev = b.map.get(msg.id)
-  const map = new Map(b.map)
-  map.set(msg.id, { ...prev, ...msg, v: (prev?.v ?? 0) + 1 })
-  const nb = new Map(buckets)
-  nb.set(msg.chatId, { ...b, map })
-  set({ buckets: nb })
-}
+let eventQueue: ServerEvent[] = []
+let flushScheduled = false
+let bootTimer: ReturnType<typeof setTimeout> | null = null
 
 function applyEvent(e: ServerEvent) {
-  switch (e.type) {
-    case 'message': {
-      upsertMessage(e.msg, e.backfill)
-      if (!e.backfill && e.msg.from !== 'me') notifyMessage(e.msg)
-      break
+  eventQueue.push(e)
+  if (flushScheduled) return
+  flushScheduled = true
+  setTimeout(() => { flushScheduled = false; flushEvents() }, 0)
+}
+
+function scheduleBoot() {
+  if (bootTimer) return
+  bootTimer = setTimeout(() => { bootTimer = null; retryBoot() }, 300)
+}
+
+function flushEvents() {
+  const events = eventQueue
+  eventQueue = []
+  if (!events.length) return
+
+  const s = get()
+  const chats = new Map(s.chats)
+  const buckets = new Map(s.buckets)
+  const typing = new Map(s.typing)
+  const online = new Map(s.online)
+  const settings = s.settings
+  const activeChat = s.activeChat
+  let chatsTouched = false
+  let bucketsTouched = false
+  let typingTouched = false
+  let onlineTouched = false
+  let activeTouched: Id | null | undefined
+
+  // lazily-cloned per-chat message maps — each chat's map clones at most once
+  // per flush no matter how many events touch it
+  const drafts = new Map<Id, Map<Id, Message>>()
+  const draft = (chatId: Id): Map<Id, Message> | null => {
+    let d = drafts.get(chatId)
+    if (d) return d
+    const b = buckets.get(chatId)
+    if (!b) return null
+    d = new Map(b.map)
+    drafts.set(chatId, d)
+    return d
+  }
+  const commitDraft = (chatId: Id) => {
+    const d = drafts.get(chatId)
+    if (!d) return
+    const b = buckets.get(chatId)
+    if (b) buckets.set(chatId, { ...b, map: d })
+    drafts.delete(chatId)
+    bucketsTouched = true
+  }
+
+  const upsert = (msg: Message, backfill: boolean) => {
+    const b = buckets.get(msg.chatId)
+    if (b) {
+      const map = draft(msg.chatId)!
+      const prev = map.get(msg.id)
+      map.set(msg.id, { ...msg, v: (prev?.v ?? 0) + 1 })
+      if (!prev) buckets.set(msg.chatId, { ...b, map, ids: [...b.ids, msg.id] })
+    } else {
+      buckets.set(msg.chatId, { ids: [msg.id], map: new Map([[msg.id, { ...msg, v: 1 }]]), hasMore: false, loaded: true })
     }
-    case 'message_update': updateMessage(e.msg); break
-    case 'messages_removed': {
-      const { buckets } = get()
-      const b = buckets.get(e.chatId)
-      if (!b) break
-      const map = new Map(b.map)
-      for (const id of e.ids) map.delete(id)
-      const nb = new Map(buckets)
-      nb.set(e.chatId, { ...b, map, ids: b.ids.filter((i) => map.has(i)) })
-      set({ buckets: nb })
-      break
+    bucketsTouched = true
+    if (!chats.get(msg.chatId)) {
+      const isGroup = msg.chatId.endsWith('@g.us')
+      chats.set(msg.chatId, {
+        id: msg.chatId, kind: isGroup ? 'group' : 'dm', title: msg.chatId.split('@')[0],
+        avatarHue: Math.abs([...msg.chatId].reduce((a, c) => a + c.charCodeAt(0), 0)) % 360,
+        participants: [], pinned: false, muted: false, archived: false, favorite: false,
+        unread: 0, markedUnread: false, lastActivity: msg.ts,
+      })
+      chatsTouched = true
     }
-    case 'delivery': {
-      const { buckets, settings } = get()
-      const b = buckets.get(e.chatId)
-      if (!b) break
-      const map = new Map(b.map)
-      let changed = false
-      for (const id of e.ids) {
-        const m = map.get(id)
-        if (m && m.delivery) {
-          const d = e.delivery === 'read' && !settings.readReceipts ? 'delivered' : e.delivery
-          map.set(id, { ...m, delivery: d, v: (m.v ?? 0) + 1 })
-          changed = true
-        }
-      }
-      if (changed) {
-        const nb = new Map(buckets)
-        nb.set(e.chatId, { ...b, map })
-        set({ buckets: nb })
-      }
-      break
-    }
-    case 'chat_update': {
-      const chats = new Map(get().chats)
-      chats.set(e.chat.id, e.chat)
-      set({ chats, order: sortChats(chats) })
-      break
-    }
-    case 'chat_removed': {
-      const chats = new Map(get().chats)
-      chats.delete(e.chatId)
-      const buckets = new Map(get().buckets)
-      buckets.delete(e.chatId)
-      set({ chats, buckets, order: sortChats(chats), activeChat: get().activeChat === e.chatId ? null : get().activeChat })
-      break
-    }
-    case 'typing': {
-      const t = new Map(get().typing)
-      if (e.names.length) t.set(e.chatId, e.names)
-      else t.delete(e.chatId)
-      set({ typing: t })
-      break
-    }
-    case 'presence': {
-      const o = new Map(get().online)
-      o.set(e.chatId, e.online)
-      set({ online: o })
-      break
-    }
-    case 'linked': {
-      set({ account: e.account, qrString: null })
-      // after a relink (logout → fresh QR → scan) nothing else asks for the
-      // snapshot — re-boot so history lands and phase flips to 'ready'
-      if (get().phase === 'linking') retryBoot()
-      break
-    }
-    case 'qr': {
-      // a QR while we're in the app means the phone unlinked us remotely
-      if (get().phase === 'ready') {
-        patch({ phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(), activeChat: null })
-      }
-      set({ qrString: e.qr })
-      break
-    }
-    case 'connection': {
-      if (e.state === 'closed') {
-        set({ bridgeStatus: 'connecting' })
-        // bridge may just be restarting — re-boot automatically while still linking
-        if (get().phase === 'linking') setTimeout(retryBoot, 2500)
-      } else if (e.state === 'open' && get().phase === 'ready' && !get().demoMode) {
-        // ws reconnected after a daemon restart — refresh the snapshot
-        retryBoot()
-      }
-      break
-    }
-    case 'history_done': {
-      // history chunks can land after connect() already resolved —
-      // re-boot merges the fresh snapshot into the running UI
-      retryBoot()
-      break
-    }
-    case 'older_result': {
-      // the phone answered an on-demand history request — no more "maybe"
-      const { buckets } = get()
-      const b = buckets.get(e.chatId)
-      if (b) {
-        const nb = new Map(buckets)
-        nb.set(e.chatId, { ...b, hasMore: e.hasMore })
-        set({ buckets: nb })
-      }
-      break
-    }
-    case 'sync_progress': {
-      patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
-      break
-    }
-    case 'bridge_error': {
-      toast(e.message, 'error')
-      break
+    const c = chats.get(msg.chatId)
+    if (c && msg.ts >= c.lastActivity) {
+      const inc = msg.from !== 'me' && activeChat !== msg.chatId && !backfill ? 1 : 0
+      chats.set(msg.chatId, { ...c, lastActivity: msg.ts, unread: c.unread + inc })
+      chatsTouched = true
     }
   }
+
+  for (const e of events) {
+    switch (e.type) {
+      case 'message': {
+        upsert(e.msg, !!e.backfill)
+        if (!e.backfill && e.msg.from !== 'me') notifyMessage(e.msg)
+        break
+      }
+      case 'message_update': {
+        const map = draft(e.msg.chatId)
+        if (!map) break
+        const prev = map.get(e.msg.id)
+        map.set(e.msg.id, { ...prev, ...e.msg, v: (prev?.v ?? 0) + 1 })
+        break
+      }
+      case 'messages_removed': {
+        const map = draft(e.chatId)
+        const b = buckets.get(e.chatId)
+        if (!map || !b) break
+        for (const id of e.ids) map.delete(id)
+        buckets.set(e.chatId, { ...b, map, ids: b.ids.filter((i) => map.has(i)) })
+        bucketsTouched = true
+        break
+      }
+      case 'delivery': {
+        const map = draft(e.chatId)
+        if (!map) break
+        for (const id of e.ids) {
+          const m = map.get(id)
+          if (m && m.delivery) {
+            const d = e.delivery === 'read' && !settings.readReceipts ? 'delivered' : e.delivery
+            map.set(id, { ...m, delivery: d, v: (m.v ?? 0) + 1 })
+          }
+        }
+        break
+      }
+      case 'chat_update': {
+        chats.set(e.chat.id, e.chat)
+        chatsTouched = true
+        break
+      }
+      case 'chat_removed': {
+        chats.delete(e.chatId)
+        buckets.delete(e.chatId)
+        drafts.delete(e.chatId)
+        chatsTouched = true
+        bucketsTouched = true
+        if (activeChat === e.chatId) activeTouched = null
+        break
+      }
+      case 'chat_cleared': {
+        const b = buckets.get(e.chatId)
+        if (b) { buckets.set(e.chatId, { ...b, ids: [], map: new Map(), hasMore: b.hasMore }); bucketsTouched = true }
+        drafts.delete(e.chatId)
+        break
+      }
+      case 'typing': {
+        if (e.names.length) typing.set(e.chatId, e.names)
+        else typing.delete(e.chatId)
+        typingTouched = true
+        break
+      }
+      case 'presence': {
+        online.set(e.chatId, e.online)
+        onlineTouched = true
+        break
+      }
+      case 'linked': {
+        set({ account: e.account, qrString: null })
+        if (get().phase === 'linking') scheduleBoot()
+        break
+      }
+      case 'qr': {
+        if (get().phase === 'ready') {
+          patch({ phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(), activeChat: null })
+        }
+        set({ qrString: e.qr })
+        break
+      }
+      case 'connection': {
+        if (e.state === 'closed') {
+          set({ bridgeStatus: 'connecting' })
+          if (get().phase === 'linking') setTimeout(retryBoot, 2500)
+        } else if (e.state === 'open' && get().phase === 'ready' && !get().demoMode) {
+          scheduleBoot()
+        }
+        break
+      }
+      case 'history_done': {
+        scheduleBoot()
+        break
+      }
+      case 'older_result': {
+        const b = buckets.get(e.chatId)
+        if (b) {
+          buckets.set(e.chatId, { ...b, hasMore: e.hasMore })
+          bucketsTouched = true
+        }
+        break
+      }
+      case 'sync_progress': {
+        patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
+        break
+      }
+      case 'bridge_error': {
+        toast(e.message, 'error')
+        break
+      }
+    }
+  }
+
+  // commit any draft message maps still pending (message_update/delivery touch
+  // drafts without rewriting the bucket entry themselves)
+  for (const chatId of [...drafts.keys()]) commitDraft(chatId)
+
+  const next: Record<string, unknown> = {}
+  if (chatsTouched) { next.chats = chats; next.order = sortChats(chats) }
+  if (bucketsTouched) next.buckets = buckets
+  if (typingTouched) next.typing = typing
+  if (onlineTouched) next.online = online
+  if (activeTouched !== undefined) next.activeChat = activeTouched
+  if (Object.keys(next).length) set(next)
 }
+
 
 // ---------- public actions ----------
 
@@ -411,7 +452,7 @@ let booting = false
 let offEvents: (() => void) | null = null
 
 export async function boot(adapter: ClientAdapter) {
-  if (booting) return
+  if (booting) { setTimeout(retryBoot, 400); return }
   booting = true
   patch({ adapter, bridgeStatus: 'connecting', demoMode: !!adapter.isDemo })
   offEvents?.() // re-boots (daemon restart) must not double-subscribe events
@@ -433,14 +474,37 @@ export async function boot(adapter: ClientAdapter) {
     return off
   }
   const chats = new Map(snap.chats.map((c) => [c.id, c]))
-  const buckets = new Map<Id, ChatBucket>()
+  // merge, never replace: a re-boot during history replay must not discard
+  // buckets the user already deep-scrolled or chats still syncing in
+  const prevBuckets = get().buckets
+  const buckets = new Map<Id, ChatBucket>(prevBuckets)
   for (const [chatId, msgs] of Object.entries(snap.topMessages)) {
-    buckets.set(chatId, {
-      ids: msgs.map((m) => m.id),
-      map: new Map(msgs.map((m) => [m.id, { ...m, v: 1 }])),
-      hasMore: true,
-      loaded: true,
-    })
+    const prev = prevBuckets.get(chatId)
+    if (!prev) {
+      buckets.set(chatId, {
+        ids: msgs.map((m) => m.id),
+        map: new Map(msgs.map((m) => [m.id, { ...m, v: 1 }])),
+        hasMore: true,
+        loaded: true,
+      })
+      continue
+    }
+    const map = new Map(prev.map)
+    const known = new Set(prev.ids)
+    const extra: Id[] = []
+    for (const m of msgs) {
+      if (known.has(m.id)) continue
+      known.add(m.id)
+      extra.push(m.id)
+      map.set(m.id, { ...m, v: 1 })
+    }
+    if (extra.length) {
+      const ids = [...prev.ids, ...extra].sort((a, b) => {
+        const ma = map.get(a)!, mb = map.get(b)!
+        return ma.ts - mb.ts || (a < b ? -1 : 1)
+      })
+      buckets.set(chatId, { ...prev, map, ids })
+    }
   }
   const contacts = new Map(snap.contacts.map((c) => [c.id, c]))
   const order = sortChats(chats)
@@ -513,10 +577,69 @@ export async function loadOlder(chatId: Id) {
   return page.messages.length
 }
 
+/** WhatsApp-style message id — the daemon passes it as messageId so the
+ *  send echo reconciles with the optimistic row by id, no fuzzy matching */
+function newMsgId() {
+  const b = crypto.getRandomValues(new Uint8Array(9))
+  return '3EB0' + [...b].map((x) => x.toString(16).padStart(2, '0')).join('').toUpperCase()
+}
+
+function optimisticContent(c: OutContent): MsgContent {
+  switch (c.kind) {
+    case 'text': return { kind: 'text', text: c.text }
+    case 'audio': return { kind: 'audio', duration: c.duration, waveform: c.waveform, voice: c.voice, url: c.url ?? c.dataUrl }
+    case 'document': return { kind: 'document', name: c.name, size: c.size, mime: c.mime, url: c.url ?? c.dataUrl }
+    case 'image': return { kind: 'image', url: c.url, w: c.w, h: c.h, caption: c.caption }
+    case 'video': return { kind: 'video', url: c.url, w: c.w, h: c.h, caption: c.caption, duration: 0 }
+    case 'poll': return { kind: 'poll', question: c.question, options: c.options, multi: c.multi }
+  }
+}
+
 export function send(chatId: Id, content: OutContent) {
   const { adapter, replyTo } = get()
-  adapter?.send(chatId, content, replyTo ?? undefined)
+  const id = newMsgId()
+  // optimistic insert — the daemon's echo arrives under the same id and
+  // upgrades this row; a failure lands as delivery:'failed'
+  applyEvent({
+    type: 'message',
+    msg: {
+      id, chatId, from: 'me', ts: Math.floor(Date.now() / 1000),
+      delivery: 'pending', replyTo: replyTo ?? undefined,
+      content: optimisticContent(content), v: 1,
+    },
+  })
+  adapter?.send(chatId, content, replyTo ?? undefined, id)
   patch({ replyTo: null })
+}
+
+/** shared file-send path — composer picker, drag-drop and paste all land here */
+export function sendFiles(chatId: Id, files: Iterable<File>, forceDoc = false) {
+  for (const f of files) sendFile(chatId, f, forceDoc)
+}
+
+export function sendFile(chatId: Id, f: File, forceDoc = false) {
+  if (f.size > 256 * 1024 * 1024) { toast(`"${f.name}" is too large (256 MB max)`, 'error'); return }
+  const rd = new FileReader()
+  rd.onload = () => {
+    const url = String(rd.result)
+    if (forceDoc || !/^(image|video)\//.test(f.type)) {
+      send(chatId, { kind: 'document', name: f.name, size: f.size, mime: f.type || 'application/octet-stream', url })
+      return
+    }
+    if (f.type.startsWith('video/')) {
+      const v = document.createElement('video')
+      v.preload = 'metadata'
+      v.onloadedmetadata = () => send(chatId, { kind: 'video', url, w: v.videoWidth, h: v.videoHeight })
+      v.onerror = () => send(chatId, { kind: 'video', url, w: 0, h: 0 })
+      v.src = url
+      return
+    }
+    const img = new Image()
+    img.onload = () => send(chatId, { kind: 'image', url, w: img.naturalWidth, h: img.naturalHeight })
+    img.onerror = () => send(chatId, { kind: 'image', url, w: 0, h: 0 })
+    img.src = url
+  }
+  rd.readAsDataURL(f)
 }
 
 export function setReplyTo(r: ReplyRef | null) { patch({ replyTo: r, editing: null }) }
@@ -564,16 +687,35 @@ export async function jumpTo(chatId: Id, messageId: Id) {
 
 export function flashDone() { patch({ flashId: null }) }
 
-// message-level actions
+// message-level actions — every mutation renders optimistically through the
+// same event path the daemon echoes back into, so the UI feels instant and
+// the wire result reconciles by id
 export function doEdit(chatId: Id, id: Id, text: string) {
+  const prev = get().buckets.get(chatId)?.map.get(id)
+  if (prev?.content.kind === 'text') {
+    applyEvent({ type: 'message_update', msg: { ...prev, content: { ...prev.content, text }, edited: true } })
+  }
   get().adapter?.edit(chatId, id, text)
   patch({ editing: null })
 }
 export function doDelete(chatId: Id, ids: Id[], forEveryone: boolean) {
+  if (forEveryone) {
+    for (const id of ids) {
+      const prev = get().buckets.get(chatId)?.map.get(id)
+      if (prev) applyEvent({ type: 'message_update', msg: { ...prev, content: { kind: 'deleted' }, reactions: undefined } })
+    }
+  } else {
+    applyEvent({ type: 'messages_removed', chatId, ids })
+  }
   get().adapter?.delete(chatId, ids, forEveryone)
   patch({ selection: null })
 }
 export function doReact(chatId: Id, id: Id, emoji: string | null) {
+  const prev = get().buckets.get(chatId)?.map.get(id)
+  if (prev) {
+    const rest = (prev.reactions ?? []).filter((r) => r.by !== 'me')
+    applyEvent({ type: 'message_update', msg: { ...prev, reactions: emoji ? [...rest, { by: 'me', emoji }] : rest } })
+  }
   get().adapter?.react(chatId, id, emoji)
 }
 export function doForward(toIds: Id[], msgs: Message[]) {
@@ -582,18 +724,28 @@ export function doForward(toIds: Id[], msgs: Message[]) {
   toast(toIds.length > 1 ? `Forwarded to ${toIds.length} chats` : 'Forwarded', 'check')
 }
 export function doFlag(chatId: Id, flag: 'pinned' | 'muted' | 'archived' | 'favorite', v: boolean) {
+  const c = get().chats.get(chatId)
+  if (c) applyEvent({ type: 'chat_update', chat: { ...c, [flag]: v } })
   get().adapter?.setChatFlag(chatId, flag, v)
 }
 export function doMarkUnread(chatId: Id, v: boolean) {
+  const c = get().chats.get(chatId)
+  if (c) applyEvent({ type: 'chat_update', chat: { ...c, markedUnread: v } })
   get().adapter?.markUnread(chatId, v)
 }
 export function doMarkRead(chatId: Id) {
+  const c = get().chats.get(chatId)
+  if (c) applyEvent({ type: 'chat_update', chat: { ...c, unread: 0, markedUnread: false } })
   get().adapter?.markRead(chatId)
 }
 export function doVote(chatId: Id, id: Id, idxs: number[]) {
   get().adapter?.vote(chatId, id, idxs)
 }
 export function doStar(chatId: Id, ids: Id[], v: boolean) {
+  for (const id of ids) {
+    const prev = get().buckets.get(chatId)?.map.get(id)
+    if (prev) applyEvent({ type: 'message_update', msg: { ...prev, starred: v } })
+  }
   get().adapter?.star(chatId, ids, v)
 }
 export function doPinMessage(chatId: Id, id: Id, pin: boolean) {

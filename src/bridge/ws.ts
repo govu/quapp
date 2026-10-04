@@ -89,8 +89,8 @@ export class WsAdapter implements ClientAdapter {
   searchMessages(chatId: Id, query: string) {
     return this.call<Message[]>('searchMessages', { chatId, query })
   }
-  send(chatId: Id, content: OutContent, replyTo?: ReplyRef) {
-    this.sendCmd('send', { chatId, content, replyTo })
+  send(chatId: Id, content: OutContent, replyTo?: ReplyRef, clientId?: Id) {
+    this.sendCmd('send', { chatId, content, replyTo, clientId })
   }
   edit(chatId: Id, messageId: Id, text: string) {
     this.sendCmd('edit', { chatId, messageId, text })
