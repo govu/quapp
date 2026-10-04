@@ -427,6 +427,8 @@ export interface RowCtx {
   /** last of the group — tail/avatar */
   last: boolean
   chat: Chat
+  /** arrived after the list mounted → plays the live-enter animation */
+  live?: boolean
 }
 
 /** hover quick-actions: reply · react · more — sits beside the bubble, toward center */
@@ -543,8 +545,11 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
   }
 
   return (
-    <div
+    <motion.div
       data-msgid={id}
+      initial={ctx.live ? { opacity: 0, y: 12, scale: 0.985 } : false}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={spring.snappy}
       className={cx(
         'group relative flex w-full items-end gap-[6px] px-3',
         out ? 'justify-end' : 'justify-start',
@@ -617,12 +622,13 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
       </div>
 
       {!out && !selecting && !isDeleted && <QuickActions m={m} out={out} chat={ctx.chat} onMenu={menu} />}
-    </div>
+    </motion.div>
   )
 }, (prev, next) =>
   prev.id === next.id &&
   prev.ctx.first === next.ctx.first &&
   prev.ctx.last === next.ctx.last &&
+  prev.ctx.live === next.ctx.live &&
   // field-level chat compare: a message arriving bumps chat.lastActivity and
   // hands every visible row a fresh ctx.chat reference — rows only render
   // id/title/kind, so lastActivity/unread churn must not re-render bubbles

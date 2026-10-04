@@ -76,6 +76,14 @@ export default function App() {
     document.documentElement.classList.toggle('anim-reduced', animLevel === 'reduced')
   }, [animLevel])
 
+  // Mica: the frame has real system material → sidebar drops its own paint
+  useEffect(() => {
+    if (new URLSearchParams(location.search).get('mica') === '1') {
+      document.body.classList.add('mica')
+      return () => document.body.classList.remove('mica')
+    }
+  }, [])
+
   const adapter = useMemo(makeAdapter, [])
 
   // kick the link/connect immediately — the onboarding screen shows the QR while connecting

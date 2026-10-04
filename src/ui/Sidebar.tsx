@@ -53,6 +53,7 @@ function previewText(chat: Chat, lastMsg: { content: import('../bridge/types').M
 const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean }) {
   const chat = useStore((s) => s.chats.get(id))
   const typing = useStore((s) => s.typing.get(id))
+  const online = useStore((s) => s.online.get(id) ?? false)
   const query = useStore((s) => s.query)
   const draft = useStore((s) => s.drafts.get(id))
   const lastMsg = useStore((s) => {
@@ -84,6 +85,9 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
     >
       <div className="relative">
         <Avatar name={chat.title} hue={chat.avatarHue} url={chat.avatarUrl} size={42} />
+        {online && chat.kind === 'dm' && (
+          <span className="absolute -bottom-px -right-px size-[12px] rounded-full bg-[var(--green)] ring-[2.5px] ring-[var(--sidebar-solid)]" />
+        )}
         {chat.kind === 'group' && (
           <span className="absolute -bottom-0.5 -right-0.5 grid size-[18px] place-items-center rounded-full bg-[var(--fill)] text-[var(--label-2)] ring-2 ring-[var(--sidebar-solid)]">
             <Users size={11} weight="fill" />
@@ -197,9 +201,9 @@ export function Sidebar() {
 
   return (
     <aside className="vibrancy hairline-r flex w-[300px] shrink-0 flex-col" role="navigation" aria-label="Chats">
-      {/* header: account switcher + actions */}
-      <div className="flex items-center gap-2 px-3 pb-1 pt-3">
-        <div className="relative">
+      {/* header: account switcher + actions — doubles as the window drag strip */}
+      <div className="drag flex items-center gap-2 px-3 pb-1 pt-3">
+        <div className="no-drag relative">
           <button
             className="press focus-ring relative rounded-full"
             onClick={() => setAccountOpen((v) => !v)}
@@ -242,14 +246,14 @@ export function Sidebar() {
         </div>
         <div className="flex-1" />
         <button
-          className="press focus-ring grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
+          className="press focus-ring no-drag grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
           onClick={() => setPalette(true)}
           aria-label="New chat"
         >
           <PencilSimple size={19} />
         </button>
         <button
-          className="press focus-ring grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
+          className="press focus-ring no-drag grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
           onClick={() => setSettingsOpen(true)}
           aria-label="Settings"
         >
@@ -258,7 +262,7 @@ export function Sidebar() {
       </div>
 
       {/* search */}
-      <div className="px-3 pb-2 pt-1">
+      <div className="no-drag px-3 pb-2 pt-1">
         <div className="flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-2.5 py-[6px] focus-within:bg-[var(--fill-2)] focus-within:ring-2 focus-within:ring-[var(--blue)]/60">
           <MagnifyingGlass size={15} className="shrink-0 text-[var(--label-3)]" />
           <input

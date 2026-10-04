@@ -274,6 +274,22 @@ body {
 .hairline-t { box-shadow: inset 0 0.5px 0 var(--separator); }
 .hairline-r { box-shadow: inset -0.5px 0 0 var(--separator); }
 
+/* ---------- frameless window chrome ---------- */
+.drag { -webkit-app-region: drag; }
+.no-drag, .no-drag * { -webkit-app-region: no-drag; }
+/* under real Mica the frame supplies the material — drop the sidebar's own
+   paint so the system material shows through; falls back to the window's
+   opaque backgroundColor when the material is unavailable */
+body.mica .vibrancy {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+body.mica .chrome { background: transparent; }
+/* reserve room for the overlay caption buttons — they sit top-right over the
+   conversation header whenever the native titlebar is hidden */
+.caption-inset { padding-right: 138px; }
+
 /* ---------- press feedback ---------- */
 .press {
   transition:

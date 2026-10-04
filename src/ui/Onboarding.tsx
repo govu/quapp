@@ -81,7 +81,8 @@ export function Onboarding() {
             : { text: 'Connecting to WhatsApp…', tone: 'idle' as const }
 
   return (
-    <div className="vibrancy grid h-full place-items-center">
+    <div className="vibrancy relative grid h-full place-items-center">
+      <div className="drag absolute inset-x-0 top-0 h-[56px]" />
       <div className="flex w-[640px] max-w-[92vw] flex-col items-center">
         <motion.div
           initial={{ opacity: 0, y: 14, scale: 0.97 }}

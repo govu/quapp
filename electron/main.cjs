@@ -93,9 +93,17 @@ function createWindow() {
     minHeight: 560,
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: '#f2f2f7',
+    backgroundColor: '#1c1c1e',
     title: 'Quapp',
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
+    // hidden native titlebar — Windows draws caption buttons via the overlay;
+    // Mica fills the frame behind the translucent sidebar (Win11, falls back
+    // to the opaque backgroundColor elsewhere)
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: '#00000000', symbolColor: '#8e8e93', height: 40 },
+    ...(process.platform === 'win32' && parseInt(process.versions.electron) >= 25 && require('node:os').release() >= '10.0.22000'
+      ? { backgroundMaterial: 'mica' }
+      : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -122,7 +130,13 @@ function createWindow() {
   Menu.setApplicationMenu(null)
 
   if (isDev) win.loadURL(DEV_URL)
-  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: { token: daemonToken() } })
+  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
+    query: {
+      token: daemonToken(),
+      // let the renderer relax its sidebar material when real Mica is behind it
+      mica: win.getBackgroundMaterial?.() === 'mica' ? '1' : '0',
+    },
+  })
 }
 
 app.whenReady().then(() => {

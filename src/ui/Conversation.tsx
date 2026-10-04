@@ -119,8 +119,8 @@ function Header({ chat }: { chat: Chat }) {
             : 'last seen recently'
 
   return (
-    <div className="chrome hairline-b z-20 flex h-[56px] shrink-0 items-center gap-3 px-4">
-      <button onClick={() => setPane(pane === 'info' ? null : 'info')} className="press flex min-w-0 items-center gap-3 rounded-lg py-1 pr-2 text-left" onContextMenu={menu}>
+    <div className="chrome hairline-b caption-inset drag z-20 flex h-[56px] shrink-0 items-center gap-3 px-4">
+      <button onClick={() => setPane(pane === 'info' ? null : 'info')} className="press no-drag flex min-w-0 items-center gap-3 rounded-lg py-1 pr-2 text-left" onContextMenu={menu}>
         <Avatar name={chat.title} hue={chat.avatarHue} url={chat.avatarUrl} size={36} />
         <div className="min-w-0">
           <div className="truncate text-[15px] font-semibold leading-[19px]">{chat.kind === 'saved' ? 'You' : chat.title}</div>
@@ -129,7 +129,7 @@ function Header({ chat }: { chat: Chat }) {
           </div>
         </div>
       </button>
-      <div className="ml-auto flex items-center gap-0.5">
+      <div className="no-drag ml-auto flex items-center gap-0.5">
         {chat.kind !== 'channel' && chat.kind !== 'saved' && (
           <>
             <IconBtn label="Voice call" onClick={() => toast('Calls open in WhatsApp on your phone', 'info')}><Phone size={19} /></IconBtn>
@@ -172,7 +172,7 @@ function SelectionBar({ chat }: { chat: Chat }) {
       initial={{ y: -56 }}
       animate={{ y: 0 }}
       transition={spring.snappy}
-      className="chrome hairline-b z-20 flex h-[56px] shrink-0 items-center gap-2 px-4"
+      className="chrome hairline-b caption-inset drag z-20 flex h-[56px] shrink-0 items-center gap-2 px-4"
     >
       <span className="text-[15px] font-semibold tabular-nums">{selection.size} selected</span>
       <div className="ml-auto flex items-center gap-1">
@@ -206,7 +206,9 @@ function SelectionBar({ chat }: { chat: Chat }) {
 
 function EmptyState() {
   return (
-    <div className="wall-none grid flex-1 place-items-center">
+    <div className="wall-none relative grid flex-1 place-items-center">
+      {/* window drag strip under the caption overlay */}
+      <div className="drag absolute inset-x-0 top-0 h-[56px]" />
       <div className="flex flex-col items-center text-center">
         <div className="grid size-[84px] place-items-center rounded-[24px] bg-[var(--fill-3)]">
           <svg width="42" height="42" viewBox="0 0 64 64" aria-hidden>

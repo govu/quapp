@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'motion/react'
-import { ArrowDown } from '@phosphor-icons/react'
+import { ArrowDown, LockSimple } from '@phosphor-icons/react'
 import type { Chat, Id, Message } from '../bridge/types'
 import { dayLabel, sameDay, spring } from '../lib/util'
 import { flashDone, loadOlder, useStore } from '../store'
@@ -13,13 +13,17 @@ type Item =
   | { t: 'unread'; key: string }
   | { t: 'more'; key: string }
   | { t: 'start'; key: string }
+  | { t: 'e2e'; key: string }
 
 const GROUP_GAP = 5 * 60 * 1000
 
-function buildItems(chat: Chat, ids: Id[], map: Map<Id, Message>, hasMore: boolean, unreadIdx: number | null, loaded: boolean): Item[] {
+function buildItems(chat: Chat, ids: Id[], map: Map<Id, Message>, hasMore: boolean, unreadIdx: number | null, loaded: boolean, liveMount: number): Item[] {
   const items: Item[] = []
   if (hasMore || !loaded) items.push({ t: 'more', key: 'more' })
-  else items.push({ t: 'start', key: 'start' }) // full history on this device
+  else {
+    items.push({ t: 'start', key: 'start' }) // full history on this device
+    if (chat.kind === 'dm') items.push({ t: 'e2e', key: 'e2e' })
+  }
   let prev: Message | null = null
   const isFirst: boolean[] = []
   const isLast: boolean[] = []
@@ -43,7 +47,7 @@ function buildItems(chat: Chat, ids: Id[], map: Map<Id, Message>, hasMore: boole
       items.push({ t: 'day', key: `d-${m.id}`, label: dayLabel(m.ts) })
     }
     if (unreadIdx !== null && i === unreadIdx) items.push({ t: 'unread', key: `u-${chat.id}` })
-    items.push({ t: 'msg', id: m.id, ctx: { first: isFirst[i], last: isLast[i], chat } })
+    items.push({ t: 'msg', id: m.id, ctx: { first: isFirst[i], last: isLast[i], chat, live: m.ts > liveMount } })
   }
   return items
 }
@@ -63,6 +67,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   const prevCount = useRef(0)
   const [away, setAway] = useState(false)
   const [pending, setPending] = useState(0)
+  const [scrolled, setScrolled] = useState(false)
 
   // the unread divider anchors on the count captured when the chat was
   // opened — markRead zeroes chat.unread but the divider must stay put
@@ -70,7 +75,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
   const unreadIdx = anchorUnread > 0 && anchorUnread < ids.length ? ids.length - anchorUnread : null
 
   const items = useMemo(
-    () => (map ? buildItems(chat, ids, map, hasMore, unreadIdx, loaded) : []),
+    () => (map ? buildItems(chat, ids, map, hasMore, unreadIdx, loaded, mountTs.current) : []),
     [chat, ids, map, hasMore, unreadIdx, loaded],
   )
 
@@ -79,7 +84,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
     getScrollElement: () => scrollRef.current,
     estimateSize: (i) => {
       const it = items[i]
-      return it.t === 'day' || it.t === 'unread' ? 44 : it.t === 'more' || it.t === 'start' ? 48 : 42
+      return it.t === 'day' || it.t === 'unread' || it.t === 'e2e' ? 44 : it.t === 'more' || it.t === 'start' ? 48 : 42
     },
     overscan: 14,
     getItemKey: (i) => (items[i].t === 'msg' ? items[i].id : items[i].key),
@@ -146,6 +151,7 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
     const atB = el.scrollHeight - el.scrollTop - el.clientHeight < 120
     atBottom.current = atB
     setAway(!atB)
+    setScrolled(el.scrollTop > 30)
     if (atB) setPending((p) => (p ? 0 : p))
     if (el.scrollTop < 300 && hasMore && !loadingOlder.current) {
       loadingOlder.current = true
@@ -157,6 +163,13 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
     virt.scrollToIndex(items.length - 1, { align: 'end', behavior: 'smooth' })
     setPending(0)
   }
+
+  // floating date: the day owning the first visible row — O(1), no walk
+  const firstVis = items[virt.getVirtualItems()[0]?.index ?? 0]
+  const floatLabel =
+    firstVis?.t === 'day' ? firstVis.label
+    : firstVis?.t === 'msg' ? dayLabel(map!.get(firstVis.id)!.ts)
+    : null
 
   return (
     <div className="absolute inset-0">
@@ -189,12 +202,44 @@ export const MessageList = memo(function MessageList({ chat, initialUnread }: { 
                   <span className="pill rounded-full px-3 py-[5px] text-[12px] font-medium text-[var(--blue)]">Unread messages</span>
                 </div>
               )}
+              {it.t === 'e2e' && (
+                <div className="mb-3 grid place-items-center px-8">
+                  <span className="pill flex items-center gap-1.5 rounded-full px-3 py-[6px] text-[11.5px] font-medium text-[var(--label-2)]">
+                    <LockSimple size={12} weight="bold" className="text-[var(--green)]" />
+                    Messages are end-to-end encrypted
+                  </span>
+                </div>
+              )}
               {it.t === 'msg' && <MessageRow id={it.id} ctx={it.ctx} />}
             </div>
           )
         })}
       </div>
       </div>
+
+      {/* floating day pill — tracks the topmost visible date while scrolling */}
+      <AnimatePresence>
+        {scrolled && floatLabel && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6, transition: { duration: 0.12 } }}
+            className="pointer-events-none absolute left-1/2 top-2.5 z-20 -translate-x-1/2"
+          >
+            <AnimatePresence mode="popLayout" initial={false}>
+              <motion.span
+                key={floatLabel}
+                initial={{ opacity: 0, scale: 0.92 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.08 } }}
+                className="menu-material block rounded-full px-3 py-[5px] text-[12px] font-medium text-[var(--label-2)]"
+              >
+                {floatLabel}
+              </motion.span>
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* jump-to-latest pill — appears when scrolled away from the tail */}
       <AnimatePresence>

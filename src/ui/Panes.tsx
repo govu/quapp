@@ -1,7 +1,7 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'motion/react'
 import {
-  Archive, Bell, BellSlash, MagnifyingGlass, Phone, PushPin, Star, Trash, VideoCamera, X,
+  Archive, Bell, BellSlash, CaretDown, CaretUp, MagnifyingGlass, Phone, PushPin, Star, Trash, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
@@ -36,6 +36,7 @@ function PaneShell({ children, title, onClose }: { children: React.ReactNode; ti
 // ---------- search within this chat ----------
 export const SearchPane = memo(function SearchPane({ chat }: { chat: Chat }) {
   const [q, setQ] = useState('')
+  const [cur, setCur] = useState(-1) // index of the match the conversation shows
   const hits = useStore((s) => s.searchHits)
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
 
@@ -45,7 +46,19 @@ export const SearchPane = memo(function SearchPane({ chat }: { chat: Chat }) {
     return () => clearTimeout(timer.current)
   }, [q, chat.id])
 
-  const msgs = hits ?? []
+  const msgs = useMemo(() => hits ?? [], [hits])
+  useEffect(() => setCur(-1), [msgs])
+
+  const go = useCallback(
+    (i: number) => {
+      if (!msgs.length) return
+      const next = ((i % msgs.length) + msgs.length) % msgs.length
+      setCur(next)
+      void jumpTo(chat.id, msgs[next].id)
+    },
+    [msgs, chat.id],
+  )
+
   return (
     <PaneShell title="Search messages" onClose={() => setPane(null)}>
       <div className="p-3">
@@ -55,10 +68,26 @@ export const SearchPane = memo(function SearchPane({ chat }: { chat: Chat }) {
             autoFocus
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === 'Escape' && setPane(null)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setPane(null)
+              else if (e.key === 'Enter') { e.preventDefault(); go(cur + (e.shiftKey ? -1 : 1)) }
+            }}
             placeholder="Search in this chat"
             className="w-full bg-transparent text-[14px] outline-none placeholder:text-[var(--label-3)]"
           />
+          {msgs.length > 0 && (
+            <>
+              <span className="shrink-0 text-[11.5px] tabular-nums text-[var(--label-3)]">
+                {cur < 0 ? msgs.length : cur + 1} / {msgs.length}
+              </span>
+              <button className="press grid size-6 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]" onClick={() => go(cur < 0 ? msgs.length - 1 : cur - 1)} aria-label="Previous match">
+                <CaretUp size={13} weight="bold" />
+              </button>
+              <button className="press grid size-6 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]" onClick={() => go(cur + 1)} aria-label="Next match">
+                <CaretDown size={13} weight="bold" />
+              </button>
+            </>
+          )}
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
@@ -68,12 +97,15 @@ export const SearchPane = memo(function SearchPane({ chat }: { chat: Chat }) {
           <Hint text={`No results for “${q}”`} />
         ) : (
           <>
-            <div className="px-2 py-1.5 text-[12px] text-[var(--label-3)]">{msgs.length} result{msgs.length === 1 ? '' : 's'}</div>
-            {msgs.map((m) => (
+            <div className="px-2 py-1.5 text-[12px] text-[var(--label-3)]">{msgs.length} result{msgs.length === 1 ? '' : 's'} — Enter for next</div>
+            {msgs.map((m, i) => (
               <button
                 key={m.id}
-                onClick={() => jumpTo(chat.id, m.id)}
-                className="press flex w-full flex-col gap-0.5 rounded-[9px] px-2.5 py-2 text-left hover:bg-[var(--fill-3)]"
+                onClick={() => go(i)}
+                className={cx(
+                  'press flex w-full flex-col gap-0.5 rounded-[9px] px-2.5 py-2 text-left',
+                  i === cur ? 'bg-[var(--blue)]/12 ring-1 ring-[var(--blue)]/40' : 'hover:bg-[var(--fill-3)]',
+                )}
               >
                 <span className="text-[11.5px] tabular-nums text-[var(--label-3)]">{timeLabel(m.ts)} · {new Date(m.ts).toLocaleDateString()}</span>
                 <span className="line-clamp-2 text-[13.5px] leading-[17px] text-[var(--label)]">
