@@ -184,6 +184,8 @@ try {
   for (const j of st.historyStart ?? []) historyStart.add(j)
   for (const [k, v] of st.removalPoint ?? []) removalPoint.set(k, v)
   S.me = st.me ?? null
+  // drop phantom chats/messages persisted before the badJid guard existed
+  for (const k of [...S.chats.keys()]) if (badJid(k)) { S.chats.delete(k); S.msgs.delete(k) }
   for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
     const bucket = new Map()
     for (const { m, p } of arr) {
@@ -397,15 +399,30 @@ function chatKind(jid) {
   return 'dm'
 }
 
+// phantom ids seen in the wild ('0@s.whatsapp.net', truncated users) must
+// never become chats — phone JIDs always carry a full-length user part.
+// (function decls: the state restore above runs before consts initialize)
+function badJid(jid) {
+  return !jid || isJidBroadcast(jid) || (jid.endsWith('@s.whatsapp.net') && jid.split('@')[0].length < 6)
+}
+// a group 'name' that is really just a phone number means history sync gave us
+// the creator's contact, not the subject — show a neutral placeholder until
+// metadata arrives
+function looksLikeNumber(t) {
+  return /^\+?[\d\s().-]{6,}$/.test(t ?? '')
+}
+
 function upsertChat(raw) {
   const jid = canonicalJid(norm(raw.id))
-  if (!jid || isJidBroadcast(jid)) return
+  if (badJid(jid)) return
   const prev = chatOf(jid)
   const kind = chatKind(jid)
+  let title = kind === 'saved' ? 'You' : (raw.name ?? raw.subject ?? prev?.title ?? displayName(jid))
+  if (kind === 'group' && looksLikeNumber(title)) title = 'Group'
   const chat = {
     id: jid,
     kind,
-    title: kind === 'saved' ? 'You' : (raw.name ?? raw.subject ?? prev?.title ?? displayName(jid)),
+    title,
     avatarHue: hue(jid),
     avatarUrl: prev?.avatarUrl,
     participants: prev?.participants ?? [],
@@ -1111,7 +1128,7 @@ function onMessages({ messages, type }) {
   for (const raw of messages) {
     learnFromKey(raw.key)
     const jid = canonicalJid(norm(raw.key?.remoteJid))
-    if (!jid || isJidBroadcast(jid)) continue
+    if (badJid(jid)) continue
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
 
