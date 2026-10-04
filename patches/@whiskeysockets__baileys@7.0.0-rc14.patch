@@ -21,3 +21,23 @@ index f2003ac00ef223468c432a1bbe0a0eb02c1453b2..e1ad457674c5478726d3648f63942279
                      if (msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT) {
                          acked = true;
                          return sendMessageAck(node, NACK_REASONS.ParsingError);
+diff --git a/lib/Utils/messages.js b/lib/Utils/messages.js
+index 247b1f12d912923d4ad032e6572fc76cd958e51b..cbfe0fb249ea9379be6add0551628e20ba5350c4 100644
+--- a/lib/Utils/messages.js
++++ b/lib/Utils/messages.js
+@@ -832,9 +832,13 @@ const REUPLOAD_REQUIRED_STATUS = [410, 404];
+  */
+ export const downloadMediaMessage = async (message, type, options, ctx) => {
+     const result = await downloadMsg().catch(async (error) => {
++        // Boom errors carry the http status in output.statusCode, not .status —
++        // checking only error?.status meant media re-upload NEVER triggered on
++        // 404/410 (expired CDN urls), leaving permanent download failures
++        const status = error?.output?.statusCode ?? error?.status
+         if (ctx &&
+-            typeof error?.status === 'number' && // treat errors with status as HTTP failures requiring reupload
+-            REUPLOAD_REQUIRED_STATUS.includes(error.status)) {
++            typeof status === 'number' && // treat errors with status as HTTP failures requiring reupload
++            REUPLOAD_REQUIRED_STATUS.includes(status)) {
+             ctx.logger.info({ key: message.key }, 'sending reupload media request...');
+             // request reupload
+             message = await ctx.reuploadRequest(message);

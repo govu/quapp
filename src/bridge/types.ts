@@ -65,7 +65,7 @@ export type MsgContent =
   | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; url?: string; file?: string }
   | { kind:'document'; name: string; size: number; mime: string; pages?: number; url?: string }
-  | { kind: 'sticker'; emoji: string }
+  | { kind: 'sticker'; emoji: string; url?: string }
   | { kind: 'poll'; question: string; options: { text: string; votes: number }[]; multi: boolean; voted?: number[] }
   | { kind: 'location'; name: string; address?: string }
   | { kind: 'system'; text: string }

@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   ArrowBendUpLeft, ArrowClockwise, ArrowCounterClockwise,
-  Check, Checks, Clock, Copy, DotsThree, FileText, PushPin, Share, MapPin,
+  Check, Checks, Clock, Copy, DotsThree, FileText, Image as ImageIcon, PushPin, Share, MapPin,
   PencilSimple, Play, SelectionAll, Smiley, Star, Trash, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
@@ -204,16 +204,41 @@ function MediaCaption({ m, caption }: { m: Message; caption: string }) {
 function ImageContent({ m }: { m: Message }) {
   const c = m.content as Extract<Message['content'], { kind: 'image' }>
   const [open, setOpen] = useState(false)
-  const ar = Math.min(Math.max(c.w / c.h, 0.5), 2.2)
+  const [fail, setFail] = useState(0) // 0 = loading, 1 = auto-retry once, 2 = unavailable
+  // w/h=0 (history rows without dims) → NaN would collapse the bubble to a sliver
+  const ar = c.w > 0 && c.h > 0 ? Math.min(Math.max(c.w / c.h, 0.5), 2.2) : 4 / 3
   return (
     <div>
       <button
-        onClick={() => { if (!useStore.getState().selection) setOpen(true) }}
+        onClick={() => { if (fail < 2 && !useStore.getState().selection) setOpen(true) }}
         className="relative block overflow-hidden rounded-[10px] bg-[var(--fill-3)]"
         style={{ aspectRatio: ar, width: '100%', maxWidth: 320 }}
         aria-label="Open image"
       >
-        <img src={c.url} alt="" className="absolute inset-0 size-full object-cover transition-transform duration-300 ease-out hover:scale-[1.02]" loading="lazy" decoding="async" />
+        {fail < 2 && (
+          <img
+            src={c.url + (fail ? `&r=${fail}` : '')}
+            alt=""
+            className="absolute inset-0 size-full object-cover transition-transform duration-300 ease-out hover:scale-[1.02]"
+            loading="lazy"
+            decoding="async"
+            onError={() => {
+              // first miss may just be an expired CDN url mid-reupload —
+              // one quiet retry, then the honest unavailable state
+              if (fail === 0) setTimeout(() => setFail(1), 4000)
+              else setFail(2)
+            }}
+          />
+        )}
+        {fail === 2 && (
+          <span className="absolute inset-0 grid place-items-center p-4 text-center">
+            <span>
+              <ImageIcon size={26} className="mx-auto text-[var(--label-3)]" />
+              <span className="mt-2 block text-[12px] font-medium text-[var(--label-3)]">Media unavailable</span>
+              <span className="mt-0.5 block text-[11px] text-[var(--label-3)]">Open WhatsApp on your phone to restore it</span>
+            </span>
+          </span>
+        )}
         {!c.caption && <MetaOverlay m={m} />}
       </button>
       {c.caption && <MediaCaption m={m} caption={c.caption} />}
@@ -345,6 +370,22 @@ function PollContent({ m, out }: { m: Message; out: boolean }) {
   )
 }
 
+function StickerContent({ m }: { m: Message }) {
+  const c = m.content as Extract<Message['content'], { kind: 'sticker' }>
+  const [failed, setFailed] = useState(false)
+  if (failed || !c.url) return <div className="select-text text-[64px] leading-none">{c.emoji}</div>
+  return (
+    <img
+      src={c.url}
+      alt={c.emoji}
+      className="size-[120px] select-none object-contain drop-shadow-sm"
+      loading="lazy"
+      draggable={false}
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
 function LocationContent({ m, out }: { m: Message; out: boolean }) {
   const c = m.content as Extract<Message['content'], { kind: 'location' }>
   return (
@@ -367,7 +408,7 @@ function Content({ m, out }: { m: Message; out: boolean }) {
     case 'document': return <DocContent m={m} out={out} />
     case 'poll': return <PollContent m={m} out={out} />
     case 'location': return <LocationContent m={m} out={out} />
-    case 'sticker': return <div className="select-text text-[64px] leading-none">{m.content.emoji}</div>
+    case 'sticker': return <StickerContent m={m} />
     case 'deleted':
       return (
         <span className="flex items-center gap-1.5 italic opacity-60">

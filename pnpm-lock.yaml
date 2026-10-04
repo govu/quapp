@@ -8,7 +8,7 @@ overrides:
   libsignal: npm:libsignal-node@2.0.1
 
 patchedDependencies:
-  '@whiskeysockets/baileys@7.0.0-rc14': 2a28dc3ebe10c5bbdb5c439c08c4bc26172db509811cfb1ead1847d44bfd3db9
+  '@whiskeysockets/baileys@7.0.0-rc14': 425667e84d2ac50ce62af73d4dd4d6cf94045693e35abe847ae62b4aa81e3409
 
 importers:
 
@@ -62,7 +62,7 @@ importers:
         version: 6.1.1(vite@8.3.2(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0))
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc14
-        version: 7.0.0-rc14(patch_hash=2a28dc3ebe10c5bbdb5c439c08c4bc26172db509811cfb1ead1847d44bfd3db9)(sharp@0.35.5(@types/node@24.19.1))(supports-color@7.2.0)
+        version: 7.0.0-rc14(patch_hash=425667e84d2ac50ce62af73d4dd4d6cf94045693e35abe847ae62b4aa81e3409)(sharp@0.35.5(@types/node@24.19.1))(supports-color@7.2.0)
       electron:
         specifier: ^44.5.1
         version: 44.5.1(supports-color@7.2.0)
@@ -3106,7 +3106,7 @@ snapshots:
       '@rolldown/pluginutils': 1.0.1
       vite: 8.3.2(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)
 
-  '@whiskeysockets/baileys@7.0.0-rc14(patch_hash=2a28dc3ebe10c5bbdb5c439c08c4bc26172db509811cfb1ead1847d44bfd3db9)(sharp@0.35.5(@types/node@24.19.1))(supports-color@7.2.0)':
+  '@whiskeysockets/baileys@7.0.0-rc14(patch_hash=425667e84d2ac50ce62af73d4dd4d6cf94045693e35abe847ae62b4aa81e3409)(sharp@0.35.5(@types/node@24.19.1))(supports-color@7.2.0)':
     dependencies:
       '@cacheable/node-cache': 1.7.6
       '@hapi/boom': 9.1.4

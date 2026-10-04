@@ -473,7 +473,8 @@ function convertContent(chatId, id, inner) {
     }
     case 'imageMessage':
       return { kind: 'image', url: mediaUrl(chatId, id), w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined }
-    case 'videoMessage': {
+    case 'videoMessage':
+    case 'ptvMessage': { // round video notes share the video proto shape
       const poster = c.jpegThumbnail ? 'data:image/jpeg;base64,' + Buffer.from(c.jpegThumbnail).toString('base64') : undefined
       return { kind: 'video', url: mediaUrl(chatId, id), poster, w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined, duration: c.seconds ?? 0 }
     }
@@ -487,7 +488,7 @@ function convertContent(chatId, id, inner) {
       return { kind: 'document', name: d.fileName ?? 'Document', size: Number(d.fileLength ?? 0), mime: d.mimetype ?? 'application/octet-stream', pages: d.pageCount, url: mediaUrl(chatId, id) }
     }
     case 'stickerMessage':
-      return { kind: 'sticker', emoji: c.firstEmoji || '🎭' }
+      return { kind: 'sticker', emoji: c.firstEmoji || '🎭', url: mediaUrl(chatId, id) }
     case 'locationMessage':
       return { kind: 'location', name: c.name || 'Location', address: c.address }
     case 'contactMessage':
@@ -509,6 +510,52 @@ function convertContent(chatId, id, inner) {
       return { kind: 'system', text: `📅 ${c.name ?? 'Event'}` }
     case 'protocolMessage':
       return null // handled at a higher level
+    // --- interactive / business surfaces: show the human-readable part ---
+    case 'buttonsMessage':
+      return { kind: 'text', text: [c.contentText, ...(c.buttons ?? []).map((b) => '▸ ' + (b.buttonText?.displayText ?? ''))].filter(Boolean).join('\n') || 'Buttons' }
+    case 'buttonsResponseMessage':
+      return { kind: 'text', text: c.selectedDisplayText ?? 'Button response' }
+    case 'templateButtonReplyMessage':
+      return { kind: 'text', text: c.selectedDisplayText ?? 'Reply' }
+    case 'listMessage':
+      return { kind: 'text', text: [c.title, c.description, '▸ ' + (c.buttonText ?? 'See options')].filter(Boolean).join('\n') }
+    case 'listResponseMessage':
+      return { kind: 'text', text: c.title ?? c.singleSelectReply?.selectedRowId ?? 'List response' }
+    case 'interactiveMessage': {
+      const body = c.body?.text ?? c.carouselCards?.[0]?.body?.text ?? c.header?.title ?? 'Interactive message'
+      return { kind: 'text', text: body }
+    }
+    case 'interactiveResponseMessage': {
+      const r = c.nativeFlowResponseMessage?.paramsJson
+      if (r) { try { return { kind: 'text', text: JSON.parse(r).id ?? 'Response' } } catch { /* fall through */ } }
+      return { kind: 'text', text: 'Response' }
+    }
+    case 'productMessage':
+      return { kind: 'text', text: `🛍️ ${c.product?.productImage ? '' : ''}${c.title ?? c.businessOwnerJid ?? 'Product'}` }
+    case 'orderMessage':
+      return { kind: 'text', text: `🧾 Order · ${c.itemCount ?? '?'} items${c.orderTitle ? ' · ' + c.orderTitle : ''}` }
+    case 'pinInChatMessage':
+      return { kind: 'system', text: '📌 Pinned a message' }
+    case 'commentMessage': {
+      const inner2 = c.message ? extractMessageContent(c.message) : null
+      if (inner2) return convertContent(chatId, id, inner2)
+      return { kind: 'system', text: '💬 Comment' }
+    }
+    case 'scheduledCallCreationMessage':
+      return { kind: 'system', text: `📞 ${c.title ?? 'Call'} scheduled` }
+    case 'groupMentionedMessage':
+    case 'groupStatusMentionMessage': {
+      const inner2 = c.message ? extractMessageContent(c.message) : null
+      if (inner2) return convertContent(chatId, id, inner2)
+      return { kind: 'system', text: 'Mentioned in a group status' }
+    }
+    case 'newsletterAdminInviteMessage':
+      return { kind: 'system', text: `📢 Channel invite · ${c.newsletterName ?? ''}` }
+    case 'pollCreationMessageV4':
+    case 'pollCreationMessageV5':
+      return { kind: 'poll', question: c.name ?? 'Poll', options: (c.options ?? []).map((o) => ({ text: o.optionName ?? '', votes: 0 })), multi: true }
+    case 'botInvokeMessage':
+      return { kind: 'system', text: '🤖 AI response' }
     default:
       return { kind: 'system', text: 'Unsupported message' }
   }
@@ -616,6 +663,11 @@ function storeRaw(raw, model) {
   }
   const chat = chatOf(model.chatId)
   if (chat) chat.lastActivity = Math.max(chat.lastActivity, model.ts)
+  // live media lands warm: a photo arriving while we're online downloads to
+  // cache immediately so the bubble never shows a spinner
+  if (S.open && S.historyDone && ['image', 'video', 'sticker', 'audio', 'document'].includes(model.content?.kind)) {
+    void mediaBuffer(model.chatId, model.id).catch(() => {})
+  }
   // learn pushNames from messages — the only name source for @lid contacts
   const sender = canonicalJid(norm(raw.key?.participant ?? raw.key?.remoteJid ?? ''))
   if (raw.pushName && sender && !isOwnJid(sender)) {
@@ -993,6 +1045,37 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
   if (S.historyDone && !syncEndEmitted) { syncEndEmitted = true; emit({ type: 'sync_progress', done: true, chats: S.chats.size, contacts: S.contacts.size, messages: total }) }
   emit({ type: 'history_done' })
   kickMetaQueue()
+  void prefetchMedia()
+}
+
+// background media warmup — the phone's CDN links are freshest right after
+// history replay, so pull the newest media of the most recent chats into the
+// disk cache at low pace; the UI's <img> then hits a warm cache instantly
+let prefetchRunning = false
+async function prefetchMedia() {
+  if (prefetchRunning) return
+  prefetchRunning = true
+  try {
+    const chats = [...S.chats.values()].sort((a, b) => b.lastActivity - a.lastActivity).slice(0, 40)
+    const queue = []
+    for (const c of chats) {
+      const b = msgsOf(c.id)
+      for (const id of [...b.keys()].slice(-25)) {
+        const e = b.get(id)
+        const k = e?.model?.content?.kind
+        if (!['image', 'video', 'sticker', 'document', 'audio'].includes(k)) continue
+        const cache = path.join(MEDIA_DIR, enc(c.id) + '--' + enc(id))
+        if (!fs.existsSync(cache)) queue.push([c.id, id])
+      }
+    }
+    if (!queue.length) return
+    log(`media prefetch: ${queue.length} files queued`)
+    for (const [chatId, id] of queue) {
+      if (!S.open) break
+      await mediaBuffer(chatId, id).catch(() => {})
+      await sleep(250) // gentle — the wire carries live traffic too
+    }
+  } finally { prefetchRunning = false }
 }
 
 function onChatsUpdate(updates) {
@@ -1797,11 +1880,23 @@ async function mediaBuffer(chatId, messageId) {
     if (fs.existsSync(cache)) return fs.readFileSync(cache)
   } catch { /* fall through */ }
   try {
-    const buf = await downloadMediaMessage(entry.proto, 'buffer', {}, { logger, reuploadRequest: (m) => S.sock.updateMediaMessage(m) })
+    // 45s cap: the reupload wait inside downloadMediaMessage has no timeout —
+    // a phone that never answers would hang this request forever
+    const buf = await Promise.race([
+      downloadMediaMessage(entry.proto, 'buffer', {}, {
+        logger,
+        reuploadRequest: (m) => S.sock.updateMediaMessage(m),
+      }),
+      sleep(45_000).then(() => { throw new Error('media download timed out') }),
+    ])
     fs.writeFileSync(cache, buf)
     return buf
   } catch (e) {
-    log('media download failed:', e?.message)
+    const msg = e?.message ?? ''
+    // 'No valid media URL' = view-once consumed elsewhere / media genuinely
+    // gone — 410 Gone so the UI can render 'unavailable' instead of retrying
+    if (/No valid media URL/i.test(msg)) { log('media gone (view-once/redacted):', messageId); return 'gone' }
+    log('media download failed:', msg)
     return null
   }
 }
@@ -1847,6 +1942,7 @@ const mediaServer = http.createServer(async (req, res) => {
   if (!m) { res.writeHead(404).end(); return }
   const [, chatId, msgId] = m.map(decodeURIComponent)
   const buf = await mediaBuffer(chatId, msgId)
+  if (buf === 'gone') { res.writeHead(410).end(); return }
   if (!buf) { res.writeHead(404).end(); return }
   res.writeHead(200, { 'content-type': mediaMime(chatId, msgId), 'cache-control': 'private, max-age=86400' })
   res.end(buf)

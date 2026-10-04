@@ -49,7 +49,20 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
     setPos(frac * dur)
   }
 
-  const bars = c.waveform?.length ? c.waveform : [6, 10, 14, 18, 12, 9, 15, 20, 8, 11]
+  // WhatsApp ships ~64 samples normalized 0..1; more than ~48 bars can't fit
+  // the bubble width — resample by averaging so flex layout never overflows
+  const src = c.waveform?.length ? c.waveform : [0.2, 0.4, 0.6, 0.8, 0.5, 0.35, 0.65, 0.9, 0.3, 0.45]
+  const raw = src.map((v) => (v > 1 ? v / 255 : v))
+  const MAX_BARS = 48
+  const bars = raw.length <= MAX_BARS
+    ? raw
+    : Array.from({ length: MAX_BARS }, (_, i) => {
+        const a = (i * raw.length) / MAX_BARS
+        const b = ((i + 1) * raw.length) / MAX_BARS
+        let s = 0
+        for (let j = Math.floor(a); j < Math.floor(b); j++) s += raw[j]
+        return s / Math.max(1, Math.floor(b) - Math.floor(a))
+      })
   const frac = dur ? pos / dur : 0
   return (
     <div className="flex w-[230px] items-center gap-2.5 py-0.5">
@@ -66,7 +79,7 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
       <div
         ref={barsRef}
         onClick={seek}
-        className="flex h-[30px] flex-1 cursor-pointer items-center gap-[2.5px]"
+        className="flex h-[30px] min-w-0 flex-1 cursor-pointer items-center gap-[2.5px] overflow-hidden"
         role="slider"
         aria-valuemin={0}
         aria-valuemax={dur}
@@ -78,8 +91,8 @@ export const WaveformPlayer = memo(function WaveformPlayer({ m, out }: { m: Mess
           return (
             <span
               key={i}
-              className={cx('w-[3px] rounded-full', played ? (out ? 'bg-white' : 'bg-[var(--blue)]') : out ? 'bg-white/40' : 'bg-[var(--label-4)]')}
-              style={{ height: Math.max(4, v * 1.5) }}
+              className={cx('min-w-[2px] flex-1 rounded-full', played ? (out ? 'bg-white' : 'bg-[var(--blue)]') : out ? 'bg-white/40' : 'bg-[var(--label-4)]')}
+              style={{ height: 4 + Math.min(1, Math.max(0, v)) * 22, maxWidth: 3 }}
             />
           )
         })}
