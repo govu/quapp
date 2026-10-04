@@ -1609,7 +1609,7 @@ setInterval(() => {
     if (now - req.asked < PHONE_PATIENCE) continue
     pendingOlder.delete(jid)
     if (req.sid) pendingSid.delete(req.sid)
-    if (req.discovery && ++unansweredStreak >= 4) {
+    if (req.discovery && now >= discoveryPauseUntil && ++unansweredStreak >= 4) {
       // phone went silent — the budget is spent; back off the sweep entirely
       discoveryPauseUntil = now + 10 * 60 * 1000
       log(`discovery: ${unansweredStreak} unanswered PDO requests — pausing sweep 10min`)
@@ -2063,6 +2063,13 @@ const CMDS = {
     emit({ type: 'chat_removed', chatId: jid })
     markDirty()
     return { ok: true }
+  },
+
+  async createGroup({ subject, participantJids }) {
+    const jids = (participantJids ?? []).map((j) => norm(String(j))).filter((j) => j.includes('@')).slice(0, 1023)
+    if (!subject?.trim() || !jids.length) return { error: 'need a subject and members' }
+    const res = await S.sock.groupCreate(subject.trim().slice(0, 100), jids)
+    return { chatId: res?.gid ?? null }
   },
 
   async leaveGroup({ chatId }) {

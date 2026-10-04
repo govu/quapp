@@ -2,14 +2,14 @@ import { Suspense, lazy, useEffect, useState } from 'react'
 import { AnimatePresence, MotionConfig } from 'motion/react'
 import { WsAdapter } from './bridge/ws'
 import type { ClientAdapter } from './bridge/types'
-import { boot, clearSelection, closeConfirm, logout, nextChat, setForwarding, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
+import { boot, clearSelection, closeConfirm, logout, nextChat, setForwarding, setGroupSheet, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
 import { Sidebar } from './ui/Sidebar'
 import { Conversation } from './ui/Conversation'
 import { Onboarding } from './ui/Onboarding'
 import { Palette } from './ui/Palette'
 import { Dialog, DialogButton, Toasts } from './ui/common'
 import { ContextMenuHost } from './ui/Menu'
-import { ForwardSheet } from './ui/Panes'
+import { ForwardSheet, GroupSheet } from './ui/Panes'
 
 const SettingsSheet = lazy(() => import('./ui/Settings').then((m) => ({ default: m.SettingsSheet })))
 
@@ -66,6 +66,7 @@ export default function App() {
   const accent = useStore((s) => s.settings.accent)
   const animLevel = useStore((s) => s.settings.animLevel)
   const forwarding = useStore((s) => s.forwarding)
+  const groupSheet = useStore((s) => s.groupSheet)
 
   // theme: system/light/dark — applied instantly, no transition on switch
   useEffect(() => {
@@ -98,7 +99,7 @@ export default function App() {
     }
   }, [])
 
-  const [adapter, setAdapter] = useState<ClientAdapter | null>(null)
+  const [, setAdapter] = useState<ClientAdapter | null>(null)
 
   // kick the link/connect immediately — the onboarding screen shows the QR while connecting
   useEffect(() => {
@@ -129,6 +130,7 @@ export default function App() {
         const s = useStore.getState()
         if (s.paletteOpen) { setPalette(false); return }
         if (s.confirm) { closeConfirm(); return }
+        if (s.groupSheet) { setGroupSheet(false); return }
         if (s.forwarding) { setForwarding(null); return }
         if (s.selection) clearSelection()
         else if (s.pane) setPane(null)
@@ -160,6 +162,7 @@ export default function App() {
           <SettingsSheet />
         </Suspense>
         <AnimatePresence>{forwarding && <ForwardSheet />}</AnimatePresence>
+        <AnimatePresence>{groupSheet && <GroupSheet />}</AnimatePresence>
         <Palette />
         <Toasts />
         <ContextMenuHost />

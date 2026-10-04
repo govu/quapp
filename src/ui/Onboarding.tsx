@@ -35,7 +35,7 @@ function RealQR({ payload }: { payload: string }) {
     let live = true
     // lazy: the QR lib (~50kb) only loads on the pairing screen
     void import('qrcode').then((m) => {
-      const QRCode = (m as { default?: typeof m }).default ?? m
+      const QRCode = ((m as Record<string, unknown>).default ?? m) as typeof import('qrcode')
       return QRCode.toString(payload, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' })
     }).then((s) => { if (live) setSvg(s) })
     return () => { live = false }

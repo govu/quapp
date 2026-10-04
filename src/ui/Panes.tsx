@@ -7,7 +7,7 @@ import {
 import type { Chat, Message } from '../bridge/types'
 import { cx, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doDownload, doFlag, doForward, doLeaveGroup, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setPane, toast, useStore,
+  doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, toast, useStore,
 } from '../store'
 import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
@@ -555,6 +555,87 @@ export function ForwardSheet() {
           className={cx('press mt-2 rounded-[10px] py-2 text-[15px] font-semibold', picked.size ? 'bg-[var(--blue)] text-white' : 'bg-[var(--fill-3)] text-[var(--label-3)]')}
         >
           Forward{picked.size > 1 ? ` to ${picked.size} chats` : ''}
+        </button>
+      </motion.div>
+    </motion.div>
+  )
+}
+
+// ---------- new-group picker ----------
+export function GroupSheet() {
+  const contacts = useStore((s) => s.contacts)
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [q, setQ] = useState('')
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const list = [...contacts.values()]
+    .filter((c) => c.id.includes('@') && (!q || c.name.toLowerCase().includes(q.toLowerCase())))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, 300)
+  const ready = name.trim().length > 0 && picked.size > 0
+  const create = () => {
+    if (!ready || busy) return
+    setBusy(true)
+    void doCreateGroup(name.trim(), [...picked]).finally(() => {
+      setBusy(false)
+      setGroupSheet(false)
+    })
+  }
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[70] grid place-items-center"
+    >
+      <div className="absolute inset-0 bg-black/30" onClick={() => setGroupSheet(false)} />
+      <motion.div
+        initial={{ scale: 0.94, y: 12, opacity: 0 }}
+        animate={{ scale: 1, y: 0, opacity: 1 }}
+        exit={{ scale: 0.96, opacity: 0 }}
+        transition={spring.pop}
+        className="menu-material relative flex h-[500px] w-[360px] flex-col rounded-2xl p-3"
+      >
+        <div className="px-1 pb-2 text-[15px] font-semibold">New group</div>
+        <input
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value.slice(0, 100))}
+          placeholder="Group name"
+          aria-label="Group name"
+          className="mb-2 rounded-[10px] bg-[var(--fill-3)] px-3 py-2 text-[14.5px] outline-none placeholder:text-[var(--label-3)] focus:ring-2 focus:ring-[var(--blue)]/50"
+        />
+        <div className="flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-2.5 py-[6px]">
+          <MagnifyingGlass size={14} className="text-[var(--label-3)]" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search contacts" className="w-full bg-transparent text-[14px] outline-none placeholder:text-[var(--label-3)]" />
+        </div>
+        <div className="mt-2 min-h-0 flex-1 overflow-y-auto">
+          {list.map((c) => {
+            const on = picked.has(c.id)
+            return (
+              <button
+                key={c.id}
+                onClick={() => setPicked((p) => { const n = new Set(p); if (on) n.delete(c.id); else n.add(c.id); return n })}
+                className="flex w-full items-center gap-3 rounded-[9px] px-2 py-[7px] text-left hover:bg-[var(--fill-3)]"
+              >
+                <Avatar name={c.name} hue={c.avatarHue} url={c.avatarUrl} size={34} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[14.5px]">{c.name}</span>
+                  {c.phone && <span className="block truncate text-[12px] text-[var(--label-3)]">{c.phone}</span>}
+                </span>
+                <span className={cx('grid size-[20px] place-items-center rounded-full border-[1.5px]', on ? 'border-[var(--blue)] bg-[var(--blue)]' : 'border-[var(--label-3)]')}>
+                  {on && <span className="text-[11px] font-bold text-white">✓</span>}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+        <button
+          disabled={!ready || busy}
+          onClick={create}
+          className={cx('press mt-2 rounded-[10px] py-2 text-[15px] font-semibold', ready && !busy ? 'bg-[var(--blue)] text-white' : 'bg-[var(--fill-3)] text-[var(--label-3)]')}
+        >
+          {busy ? 'Creating…' : `Create${picked.size ? ` · ${picked.size} member${picked.size > 1 ? 's' : ''}` : ''}`}
         </button>
       </motion.div>
     </motion.div>

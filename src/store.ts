@@ -84,6 +84,8 @@ interface State {
   confirm: { title: string; body?: string; ok?: string; run: () => void } | null
   /** global starred-message list (loaded lazily when the pane opens) */
   starredList: Message[] | 'loading' | null
+  /** new-group picker sheet */
+  groupSheet: boolean
 }
 
 let toastId = 0
@@ -168,6 +170,7 @@ export const useStore = create<State>(() => ({
   openUnread: 0,
   confirm: null,
   starredList: null,
+  groupSheet: false,
   settings: loadSettings(),
 }))
 
@@ -365,7 +368,7 @@ function flushEvents() {
         if (!map) break
         const prev = map.get(e.msg.id)
         if (!prev) break // an update for an unloaded message must not create a phantom map-only entry
-        map.set(e.msg.id, { ...prev, ...e.msg, v: prev.v + 1 })
+        map.set(e.msg.id, { ...prev, ...e.msg, v: (prev.v ?? 0) + 1 })
         break
       }
       case 'messages_removed': {
@@ -982,6 +985,19 @@ export function setDraft(chatId: Id, text: string) {
   }, 400)
 }
 export function setPalette(v: boolean) { patch({ paletteOpen: v }) }
+export function setGroupSheet(v: boolean) { patch({ groupSheet: v }) }
+
+export async function doCreateGroup(subject: string, jids: Id[]) {
+  const r = await get().adapter?.createGroup?.(subject, jids).catch(() => undefined)
+  if (r?.chatId) {
+    toast('Group created', 'check')
+    // the group's chat row arrives via chats.upsert — open it once it lands
+    for (let i = 0; i < 20 && !get().chats.has(r.chatId); i++) await new Promise((res) => setTimeout(res, 400))
+    if (get().chats.has(r.chatId)) openChat(r.chatId)
+  } else {
+    toast(r?.error ?? "Couldn't create the group — try again", 'error')
+  }
+}
 export function setTypingNotify(chatId: Id, v: boolean) {
   get().adapter?.setTyping(chatId, v)
 }

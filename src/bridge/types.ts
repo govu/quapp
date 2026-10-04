@@ -217,6 +217,8 @@ export interface ClientAdapter {
   block?(jid: Id, blocked: boolean): void
   /** group subject/description — admin only; errors surface via bridge_error */
   groupEdit?(chatId: Id, p: { subject?: string; description?: string }): void
+  /** create a group; resolves to the new chat id */
+  createGroup?(subject: string, participantJids: Id[]): Promise<{ chatId?: Id; error?: string }>
   storageStats?(): Promise<{ bytes: number; files: number }>
   clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void

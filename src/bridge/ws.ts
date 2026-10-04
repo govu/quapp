@@ -171,6 +171,9 @@ export class WsAdapter implements ClientAdapter {
   starred() { return this.call<{ msgs: Message[] }>('starred').then((r) => r.msgs) }
   block(jid: Id, blocked: boolean) { this.sendCmd('block', { jid, blocked }) }
   groupEdit(chatId: Id, p: { subject?: string; description?: string }) { this.sendCmd('groupEdit', { chatId, ...p }) }
+  createGroup(subject: string, participantJids: Id[]) {
+    return this.call<{ chatId?: Id; error?: string }>('createGroup', { subject, participantJids })
+  }
   download(chatId: Id, messageId: Id) {
     return this.call<{ path?: string; error?: string }>('download', { chatId, messageId })
   }

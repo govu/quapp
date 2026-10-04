@@ -9,7 +9,7 @@ import type { Chat, Id } from '../bridge/types'
 import { cx, highlight, listTime } from '../lib/util'
 import {
   confirmClearChat, confirmDeleteChat, doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setPane, setQuery, setRelinkPrompt,
-  setSettingsOpen, setShowArchived, useStore, type Filter,
+  setGroupSheet, setSettingsOpen, setShowArchived, useStore, type Filter,
 } from '../store'
 import { Avatar } from './common'
 import { showContextMenu } from './Menu'
@@ -245,6 +245,13 @@ export function Sidebar() {
                   >
                     <span className="grid size-[26px] place-items-center rounded-full bg-[var(--fill)]"><Star size={14} /></span>
                     Starred messages
+                  </button>
+                  <button
+                    className="press flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]"
+                    onClick={() => { setAccountOpen(false); setGroupSheet(true) }}
+                  >
+                    <span className="grid size-[26px] place-items-center rounded-full bg-[var(--fill)]"><Users size={14} /></span>
+                    New group
                   </button>
                   <button
                     className="press mt-1 flex w-full items-center gap-2.5 rounded-[9px] px-3 py-2 text-left text-[14px] hover:bg-[var(--fill-2)]"
