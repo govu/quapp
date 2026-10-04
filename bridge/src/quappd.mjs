@@ -905,18 +905,27 @@ function onConn({ connection, lastDisconnect, qr }) {
           if (!msgsOf(j).size) return false // empty chats handled above
           return lastMsgTs(j) < staleBefore // newest stored msg is old → tail gap
         })
+        // PDO requests are phone-answered and rate-limited — WhatsApp stops
+        // replying entirely if we burst (observed: ~15 answers then silence).
+        // Prioritize what the user sees: stale chats newest-first, then a few
+        // empties; deep archive refresh stays on markRead when opened.
+        const staleSorted = staleChats
+          .map((j) => [j, lastMsgTs(j) || 0])
+          .sort((a, b) => b[1] - a[1])
+          .map(([j]) => j)
         const candidates = [
-          ...emptyChats,
-          ...staleChats,
-          ...[...S.contacts.keys()].filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j)),
-        ].slice(0, 200)
+          ...staleSorted.slice(0, 60),
+          ...emptyChats.slice(0, 20),
+          ...[...S.contacts.keys()].filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j)).slice(0, 20),
+        ]
         log(`contact discovery: ${candidates.length} candidates (${emptyChats.length} empty, ${staleChats.length} stale)`)
         if (!candidates.length) return
         let i = 0
         const tick = () => {
           if (!S.open || i >= candidates.length) return
-          void requestHistory(candidates[i++], 25)
-          setTimeout(tick, 1600)
+          if (Date.now() < discoveryPauseUntil) { setTimeout(tick, 60000); return } // rate-limited — idle the sweep
+          void requestHistory(candidates[i++], 50, false, true, true) // tail anchor — the gap is at the newest end
+          setTimeout(tick, 4000) // ~15/min — under the phone's PDO patience
         }
         tick()
       }, 25000)
@@ -1440,22 +1449,27 @@ async function kickMetaQueue() {
 // The wire field is named ...TimestampMs but the phone reads UNIX SECONDS —
 // whatsmeow found it the hard way; multiplying by 1_000 lands in year ~56000
 // and the phone silently never answers (ZapFast AGENTS.md warns the same).
-async function requestHistory(chatId, count = 80, explicit = false) {
+// tail=false → anchor at our OLDEST stored message (scroll-back: the phone
+// sends messages before it). tail=true → anchor at NOW with an empty id (the
+// phone sends the newest `count` messages — closes the gap between our newest
+// stored row and the present, which a backward anchor can never reach).
+async function requestHistory(chatId, count = 80, explicit = false, tail = false, discovery = false) {
   const jid = canonicalJid(norm(chatId))
   if (!S.open || !jid || !S.sock?.fetchMessageHistory) return false
-  if (historyStart.has(jid)) return false
+  if (historyStart.has(jid) && !tail) return false
+  if (discovery && Date.now() < discoveryPauseUntil) return false
   const prev = pendingOlder.get(jid)
   if (prev) { if (explicit) prev.explicit = true; return false }
   const bucket = msgsOf(jid)
-  const oldest = bucket.size
+  const oldest = bucket.size && !tail
     ? [...bucket.values()].reduce((a, b) => (Number(a.proto.messageTimestamp) < Number(b.proto.messageTimestamp) ? a : b))
     : null
   const key = oldest?.proto?.key
     ? { remoteJid: jid, id: oldest.proto.key.id, fromMe: !!oldest.proto.key.fromMe }
     : { remoteJid: jid, id: '', fromMe: false }
-  // messageTimestamp is already seconds; empty chats anchor at "now"
+  // messageTimestamp is already seconds; empty/tail anchors request at "now"
   const ts = oldest ? Number(oldest.proto.messageTimestamp) : Math.floor(Date.now() / 1000)
-  pendingOlder.set(jid, { asked: Date.now(), explicit })
+  pendingOlder.set(jid, { asked: Date.now(), explicit, discovery })
   try {
     // fetchMessageHistory returns the PDO request session id — the phone
     // echoes it on the ON_DEMAND chunk, so we can match exactly which chat
@@ -1472,8 +1486,14 @@ async function requestHistory(chatId, count = 80, explicit = false) {
   }
 }
 
+// consecutive unanswered PDO requests = the phone is rate-limiting → pause the
+// discovery sweep (a dead sweep burns the whole budget). Any response resets.
+let discoveryPauseUntil = 0
+let unansweredStreak = 0
+
 // ON_DEMAND chunks resolve pending requests (ZapFast answer_older)
 function answerOlder(fileCounts) {
+  unansweredStreak = 0
   for (const [jid, n, moreOnPhone] of fileCounts) {
     if (moreOnPhone === 1 || moreOnPhone === 3) historyStart.add(jid) // no more / no access
     const req = pendingOlder.get(jid)
@@ -1490,6 +1510,12 @@ setInterval(() => {
     if (now - req.asked < PHONE_PATIENCE) continue
     pendingOlder.delete(jid)
     if (req.sid) pendingSid.delete(req.sid)
+    if (req.discovery && ++unansweredStreak >= 4) {
+      // phone went silent — the budget is spent; back off the sweep entirely
+      discoveryPauseUntil = now + 10 * 60 * 1000
+      log(`discovery: ${unansweredStreak} unanswered PDO requests — pausing sweep 10min`)
+      unansweredStreak = 0
+    }
     emit({ type: 'older_result', chatId: jid, count: 0, hasMore: true })
   }
 }, 15000)
@@ -1710,7 +1736,7 @@ const CMDS = {
     }
     // live presence for the open chat + pull history if we have none yet
     try { await S.sock?.presenceSubscribe(jid) } catch { /* offline */ }
-    if (!msgsOf(jid).size) void requestHistory(jid, 80)
+    if (!msgsOf(jid).size) void requestHistory(jid, 80, false, true)
     return chat
   },
 
@@ -1734,10 +1760,10 @@ const CMDS = {
       emit({ type: 'chat_update', chat })
     }
     // ZapFast: a chat that opened with no local messages asks the phone — and
-    // a chat whose newest message is older than a couple hours gets its tail
-    // refreshed too, closing gaps left by dropped deliveries
-    if (!msgsOf(jid).size) void requestHistory(jid, 80, true)
-    else if (Date.now() - (lastMsgTs(jid) || 0) > 2 * 3600 * 1000) void requestHistory(jid, 25, true)
+    // a chat whose newest message is older than a couple hours gets its TAIL
+    // refreshed (now-anchor — a backward anchor can never reach the gap)
+    if (!msgsOf(jid).size) void requestHistory(jid, 80, true, true)
+    else if (Date.now() - (lastMsgTs(jid) || 0) > 2 * 3600 * 1000) void requestHistory(jid, 50, true, true)
   },
 
   async markUnread({ chatId, value }) {

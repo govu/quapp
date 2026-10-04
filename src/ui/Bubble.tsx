@@ -149,7 +149,7 @@ function Lightbox({ url, caption, onClose }: { url: string; caption?: string; on
       )}
       <button
         onClick={onClose}
-        className="press absolute right-5 top-5 grid size-9 place-items-center rounded-full bg-white/10 text-white hover:bg-white/20"
+        className="press absolute right-5 top-14 grid size-9 place-items-center rounded-full bg-white/10 text-white hover:bg-white/20"
         aria-label="Close"
       >
         <X size={18} weight="bold" />
