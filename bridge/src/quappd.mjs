@@ -149,6 +149,9 @@ const STATE_FILE = path.join(DATA, 'state.v1.json')
 const MSGS_PERSIST_CAP = 400 // per chat — deep scrolls stay on-demand anyway
 let stateDirty = false
 let stateTimer = null
+// phone-side PDO silence — persisted so a restart doesn't re-burn the budget
+let pdoSilentUntil = 0
+let pdoPauseStreak = 0
 const markDirty = () => {
   stateDirty = true
   if (stateTimer) return
@@ -179,6 +182,8 @@ function writeState() {
       removalPoint: [...removalPoint],
       me: S.me,
       msgs,
+      pdoSilentUntil,
+      pdoPauseStreak,
     }
     const tmp = STATE_FILE + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(st))
@@ -194,6 +199,11 @@ try {
   for (const j of st.historyStart ?? []) historyStart.add(j)
   for (const [k, v] of st.removalPoint ?? []) removalPoint.set(k, v)
   S.me = st.me ?? null
+  // the phone's PDO cooldown outlives a daemon restart — restore the silence
+  // window or every app launch re-bursts requests into a phone that's already
+  // ignoring us, which resets its cooldown clock forever
+  pdoSilentUntil = st.pdoSilentUntil ?? 0
+  pdoPauseStreak = st.pdoPauseStreak ?? 0
   // drop phantom chats/messages persisted before the badJid guard existed
   for (const k of [...S.chats.keys()]) if (badJid(k)) { S.chats.delete(k); S.msgs.delete(k) }
   for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
@@ -1078,11 +1088,13 @@ function onConn({ connection, lastDisconnect, qr }) {
         if (!S.open || S.sock !== openSock || discoveryRan) return
         discoveryRan = true
         const known = new Set(S.chats.keys())
-        const isDm = (j) => j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')
+        // newsletters never answer PDO; DMs AND groups both do (whatsmeow and
+        // whatsapp-web.js both pull group history this way)
+        const pdoable = (j) => j.endsWith('@s.whatsapp.net') || j.endsWith('@lid') || j.endsWith('@g.us')
         const staleBefore = Date.now() - 6 * 3600 * 1000
-        const emptyChats = [...known].filter((j) => !msgsOf(j).size && isDm(j))
+        const emptyChats = [...known].filter((j) => !msgsOf(j).size && (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')))
         const staleChats = [...known].filter((j) => {
-          if (!isDm(j) || !msgsOf(j).size) return false // groups/newsletters: the phone won't answer PDO for these
+          if (!pdoable(j) || !msgsOf(j).size) return false
           return lastMsgTs(j) < staleBefore // newest stored msg is old → tail gap
         })
         // PDO requests are phone-answered and rate-limited — WhatsApp stops
@@ -1103,7 +1115,7 @@ function onConn({ connection, lastDisconnect, qr }) {
         let i = 0
         const tick = () => {
           if (!S.open || i >= candidates.length) return
-          if (Date.now() < discoveryPauseUntil) { setTimeout(tick, 60000); return } // rate-limited — idle the sweep
+          if (Date.now() < pdoSilentUntil) { setTimeout(tick, 60000); return } // rate-limited — idle the sweep
           void requestHistory(candidates[i++], 50, false, true, true) // tail anchor — the gap is at the newest end
           setTimeout(tick, 4000) // ~15/min — under the phone's PDO patience
         }
@@ -1266,6 +1278,15 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
     }
     const counts = new Map(filed)
     for (const jid of chatMore.keys()) if (!counts.has(jid)) counts.set(jid, 0)
+    // the phone answered — the cooldown is over; lift the persisted silence
+    // now rather than at the window's expiry so requests flow immediately
+    if (pdoSilentUntil !== 0 || pdoPauseStreak !== 0) {
+      pdoSilentUntil = 0
+      pdoPauseStreak = 0
+      markDirty()
+      log('discovery: phone answered PDO — silence lifted')
+    }
+    unansweredStreak = 0
     answerOlder([...counts.entries()].map(([jid, count]) => [jid, count, chatMore.get(jid)]))
   }
   maybeReady()
@@ -1670,7 +1691,10 @@ async function requestHistory(chatId, count = 80, explicit = false, tail = false
   const jid = canonicalJid(norm(chatId))
   if (!S.open || !jid || !S.sock?.fetchMessageHistory) return false
   if (historyStart.has(jid) && !tail) return false
-  if (discovery && Date.now() < discoveryPauseUntil) return false
+  // while the phone is demonstrably ignoring PDO, EVERY request is a burn —
+  // discovery, tail-on-open, even explicit scrolls. Block them all until the
+  // window lifts; a user scroll just fails back to cached like it does now
+  if (Date.now() < pdoSilentUntil) return false
   const prev = pendingOlder.get(jid)
   if (prev) { if (explicit) prev.explicit = true; return false }
   const bucket = msgsOf(jid)
@@ -1704,9 +1728,10 @@ async function requestHistory(chatId, count = 80, explicit = false, tail = false
   }
 }
 
-// consecutive unanswered PDO requests = the phone is rate-limiting → pause the
-// discovery sweep (a dead sweep burns the whole budget). Any response resets.
-let discoveryPauseUntil = 0
+// consecutive unanswered PDO requests = the phone is rate-limiting → pause.
+// The pause is persisted (pdoSilentUntil, declared at ~line 153) and escalates
+// each consecutive silence — or every restart re-burns the budget into a phone
+// that's already ignoring us. Any response resets everything.
 const callState = new Map() // call-id -> {from, answered, mine, logged, status}
 let unansweredStreak = 0
 let discoveryRan = false // the sweep runs once per session — never re-bursts
@@ -1736,10 +1761,14 @@ setInterval(() => {
     if (now - req.asked < PHONE_PATIENCE) continue
     pendingOlder.delete(jid)
     if (req.sid) pendingSid.delete(req.sid)
-    if (req.discovery && now >= discoveryPauseUntil && ++unansweredStreak >= 4) {
-      // phone went silent — the budget is spent; back off the sweep entirely
-      discoveryPauseUntil = now + 10 * 60 * 1000
-      log(`discovery: ${unansweredStreak} unanswered PDO requests — pausing sweep 10min`)
+    if (req.discovery && now >= pdoSilentUntil && ++unansweredStreak >= 4) {
+      // phone went silent — escalating backoff, persisted across restarts.
+      // 10min → 30 → 90 → 4h cap; re-bursting every 10min kept the phone's
+      // own cooldown alive forever (observed: weeks of silence)
+      pdoPauseStreak = Math.min(pdoPauseStreak + 1, 8)
+      pdoSilentUntil = now + Math.min(10 * 60 * 1000 * (3 ** pdoPauseStreak), 4 * 3600 * 1000)
+      markDirty()
+      log(`discovery: phone silent (streak ${pdoPauseStreak}) — pausing PDO ${Math.round((pdoSilentUntil - now) / 60000)}min`)
       unansweredStreak = 0
     }
     emit({ type: 'older_result', chatId: jid, count: 0, hasMore: true })
@@ -1806,7 +1835,7 @@ const CMDS = {
     lastTailAsk.clear()
     callState.clear()
     discoveryRan = false
-    discoveryPauseUntil = 0; unansweredStreak = 0
+    pdoSilentUntil = 0; pdoPauseStreak = 0; unansweredStreak = 0; markDirty()
     S.subscribedPresence.clear()
     S.typingTimers.clear()
     S.chats.clear(); S.msgs.clear(); S.contacts.clear()
