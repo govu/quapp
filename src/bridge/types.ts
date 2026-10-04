@@ -63,8 +63,8 @@ export interface LinkPreview {
 
 export type MsgContent =
   | { kind: 'text'; text: string; linkPreview?: LinkPreview }
-  | { kind: 'image'; url: string; w: number; h: number; caption?: string }
-  | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number }
+  | { kind: 'image'; url: string; poster?: string; w: number; h: number; caption?: string }
+  | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number; round?: boolean }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; url?: string; file?: string }
   | { kind:'document'; name: string; size: number; mime: string; pages?: number; url?: string }
   | { kind: 'sticker'; emoji: string; url?: string }
@@ -147,7 +147,7 @@ export type OutContent =
   | { kind: 'text'; text: string }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: true; url?: string; dataUrl?: string }
   | { kind: 'document'; name: string; size: number; mime: string; url?: string; dataUrl?: string }
-  | { kind: 'image'; url: string; w: number; h: number; caption?: string }
+  | { kind: 'image'; url: string; poster?: string; w: number; h: number; caption?: string }
   | { kind: 'video'; url: string; w: number; h: number; caption?: string }
   | { kind: 'poll'; question: string; options: { text: string; votes: number }[]; multi: boolean }
 

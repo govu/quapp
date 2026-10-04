@@ -68,6 +68,17 @@ export function fileSize(n: number) {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
+/** "+573012345678" → "+57 301 234 5678" — country code + last 10 in 3-3-4.
+ *  Names that aren't bare phone numbers pass through untouched. */
+export function formatPhone(title: string): string {
+  const m = /^\+(\d{7,15})$/.exec(title)
+  if (!m) return title
+  const d = m[1]
+  const cc = d.slice(0, Math.max(1, d.length - 10))
+  const rest = d.slice(-10)
+  return `+${cc} ${rest.slice(0, 3)} ${rest.slice(3, 6)} ${rest.slice(6)}`
+}
+
 // WhatsApp-style markup: *bold* _italic_ ~strike~ `code`
 export function renderMarkup(text: string): string {
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')

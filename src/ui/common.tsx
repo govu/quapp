@@ -8,14 +8,17 @@ import { useStore } from '../store'
 const AVATAR_GRADIENTS = [
   ['#5ac8fa', '#0a84ff'], ['#64d2ff', '#5e5ce6'], ['#ff9f0a', '#ff453a'],
   ['#30d158', '#0a84ff'], ['#bf5af2', '#ff375f'], ['#ffd60a', '#ff9f0a'],
-  ['#66d4cf', '#30b0c7'], ['#ff6482', '#bf5af2'], ['#98989d', '#636366'],
+  ['#66d4cf', '#30b0c7'], ['#ff6482', '#bf5af2'], ['#8e8e93', '#48484a'],
 ]
 
 export const Avatar = memo(function Avatar({
   name, hue, url, size = 40, className,
 }: { name: string; hue: number; url?: string; size?: number; className?: string }) {
   const g = AVATAR_GRADIENTS[Math.abs(Math.floor(hue / 40)) % AVATAR_GRADIENTS.length]
-  const initials = name.split(' ').map((w) => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase()
+  // initials from real letters only — an emoji/punctuation "initial" renders
+  // as an ugly glyph inside the circle; phone numbers keep their digits
+  const letters = name.replace(/[^\p{L}\p{N} ]/gu, ' ').split(' ').map((w) => w[0]).filter(Boolean)
+  const initials = letters.slice(0, 2).join('').toUpperCase()
   const [badUrl, setBadUrl] = useState<string | null>(null)
   const showImg = url && badUrl !== url
   return (
@@ -30,10 +33,16 @@ export const Avatar = memo(function Avatar({
     >
       {showImg ? (
         <img src={url} alt="" className="size-full object-cover" loading="lazy" decoding="async" onError={() => setBadUrl(url)} />
-      ) : (
+      ) : initials ? (
         <span className="grid size-full place-items-center font-semibold text-white/95" style={{ letterSpacing: '0.02em' }}>
-          {initials || '?'}
+          {initials}
         </span>
+      ) : (
+        // no usable letters (emoji-only or symbol name) — person glyph, not a
+        // broken character
+        <svg viewBox="0 0 24 24" className="size-full p-[22%] text-white/85" fill="currentColor" aria-hidden>
+          <path d="M12 12a4.6 4.6 0 1 0-4.6-4.6A4.6 4.6 0 0 0 12 12Zm0 2.2c-3.7 0-8.4 1.9-8.4 5.6v.7a.8.8 0 0 0 .8.8h15.2a.8.8 0 0 0 .8-.8v-.7c0-3.7-4.7-5.6-8.4-5.6Z" />
+        </svg>
       )}
       <span className="pointer-events-none absolute inset-0 rounded-full ring-1 ring-black/[0.06] ring-inset" />
     </div>

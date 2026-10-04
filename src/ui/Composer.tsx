@@ -309,7 +309,7 @@ export const Composer = memo(function Composer({ chat }: { chat: Chat }) {
               }
             }}
             placeholder="Message"
-            className="w-full resize-none rounded-[18px] border border-[var(--field-border)] bg-[var(--field)] py-[7px] pl-3.5 pr-10 text-[15px] leading-[20px] outline-none placeholder:text-[var(--label-3)] focus:border-[var(--blue)]/50"
+            className="composer-input w-full resize-none rounded-[18px] border border-[var(--field-border)] bg-[var(--field)] py-[7px] pl-3.5 pr-10 text-[15px] leading-[20px] outline-none placeholder:text-[var(--label-3)] focus:border-[var(--blue)]/50"
             aria-label="Message"
           />
           <button

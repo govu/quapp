@@ -6,7 +6,7 @@ import {
   PushPin, Plus, Trash, Users, Star, ArrowLeft, X,
 } from '@phosphor-icons/react'
 import type { Chat, Id } from '../bridge/types'
-import { cx, highlight, listTime } from '../lib/util'
+import { cx, formatPhone, highlight, listTime } from '../lib/util'
 import {
   confirmClearChat, confirmDeleteChat, doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setPane, setQuery, setRelinkPrompt,
   setGroupSheet, setSettingsOpen, setShowArchived, useStore, type Filter,
@@ -102,7 +102,7 @@ const ChatRow = memo(function ChatRow({ id, active }: { id: Id; active: boolean 
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
           <span className="truncate text-[15px] font-semibold leading-[19px]">
-            {chat.kind === 'saved' ? 'You' : query ? <Hl text={chat.title} q={query} /> : chat.title}
+            {chat.kind === 'saved' ? 'You' : query ? <Hl text={chat.title} q={query} /> : formatPhone(chat.title)}
           </span>
           <span className={cx('ml-auto shrink-0 text-[12px] tabular-nums', chat.unread > 0 && !chat.muted ? 'text-[var(--blue)] font-medium' : 'text-[var(--label-3)]')}>
             {lastMsg ? listTime(lastMsg.ts) : ''}

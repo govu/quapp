@@ -211,8 +211,8 @@ function TextContent({ m, out }: { m: Message; out: boolean }) {
           className={cx('mt-1.5 block overflow-hidden rounded-[10px] no-underline', out ? 'bg-white/[0.14]' : 'bg-black/[0.05] dark:bg-white/[0.07]')}
         >
           <div className={cx('px-3 py-2 text-[13px]', out ? 'text-white' : '')} style={{ borderLeft: '3px solid var(--green)' }}>
-            <div className="font-semibold">{c.linkPreview.title}</div>
-            {c.linkPreview.description && <div className={cx('line-clamp-2', out ? 'text-white/75' : 'text-[var(--label-2)]')}>{c.linkPreview.description}</div>}
+            <div className="font-semibold line-clamp-2">{c.linkPreview.title}</div>
+            {c.linkPreview.description && <div className={cx('line-clamp-3', out ? 'text-white/75' : 'text-[var(--label-2)]')}>{c.linkPreview.description}</div>}
             <div className={cx('mt-0.5 text-[11px] uppercase tracking-wide', out ? 'text-white/60' : 'text-[var(--label-3)]')}>{c.linkPreview.site ?? safeHost(c.linkPreview.url)}</div>
           </div>
         </a>
@@ -244,10 +244,24 @@ function ImageContent({ m }: { m: Message }) {
         className="relative block overflow-hidden rounded-[10px] bg-[var(--fill-3)]"
         // width must be definite — bare '100%' inside a shrink-wrap bubble
         // resolves to ~0 and the media box collapses into a sliver; the
-        // min-width floor breaks the cycle (parent can only grow to it)
-        style={{ aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320 }}
+        // min-width floor breaks the cycle (parent can only grow to it).
+        // a failed/panorama media must not stretch into a wall either —
+        // unavailable state collapses to a compact card
+        style={fail === 2
+          ? { width: 240, height: 118 }
+          : { aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320, maxHeight: 400 }}
         aria-label="Open image"
       >
+        {fail === 0 && (
+          <>
+            {/* WhatsApp embeds a low-res jpegThumbnail in every image — show it
+                blurred while the full file fetches instead of an empty box */}
+            {c.poster && <img src={c.poster} alt="" aria-hidden className="absolute inset-0 size-full scale-110 object-cover blur-md" />}
+            <span className="absolute inset-0 grid place-items-center">
+              <span className="size-7 animate-spin rounded-full border-[2.5px] border-white/20 border-t-white/80" />
+            </span>
+          </>
+        )}
         {fail < 2 && (
           <img
             src={c.url + (fail ? `&r=${fail}` : '')}
@@ -264,10 +278,10 @@ function ImageContent({ m }: { m: Message }) {
           />
         )}
         {fail === 2 && (
-          <span className="absolute inset-0 grid place-items-center p-4 text-center">
+          <span className="absolute inset-0 grid place-items-center p-3 text-center">
             <span>
-              <ImageIcon size={26} className="mx-auto text-[var(--label-3)]" />
-              <span className="mt-2 block text-[12px] font-medium text-[var(--label-3)]">Media unavailable</span>
+              <ImageIcon size={20} className="mx-auto text-[var(--label-3)]" />
+              <span className="mt-1.5 block text-[12px] font-medium text-[var(--label-3)]">Media unavailable</span>
               <span className="mt-0.5 block text-[11px] text-[var(--label-3)]">Open WhatsApp on your phone to restore it</span>
             </span>
           </span>
@@ -287,12 +301,15 @@ function VideoContent({ m }: { m: Message }) {
   const ar = c.w && c.h ? Math.min(Math.max(c.w / c.h, 0.6), 2.2) : 16 / 9
   return (
     <div>
-      <div className="relative overflow-hidden rounded-[10px] bg-black" style={{ aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320 }}>
+      <div
+        className={cx('relative overflow-hidden bg-black', c.round ? 'size-[240px] rounded-full' : 'rounded-[10px]')}
+        style={fail ? { width: 240, height: 118 } : c.round ? undefined : { aspectRatio: ar, width: '100%', minWidth: 280, maxWidth: 320, maxHeight: 400 }}
+      >
         {fail ? (
-          <span className="absolute inset-0 grid place-items-center p-4 text-center">
+          <span className="absolute inset-0 grid place-items-center p-3 text-center">
             <span>
-              <ImageIcon size={26} className="mx-auto text-white/50" />
-              <span className="mt-2 block text-[12px] font-medium text-white/70">Media unavailable</span>
+              <ImageIcon size={20} className="mx-auto text-white/50" />
+              <span className="mt-1.5 block text-[12px] font-medium text-white/70">Media unavailable</span>
               <span className="mt-0.5 block text-[11px] text-white/50">Open WhatsApp on your phone to restore it</span>
             </span>
           </span>
@@ -303,7 +320,7 @@ function VideoContent({ m }: { m: Message }) {
             autoPlay
             playsInline
             onError={() => setFail(true)}
-            className="absolute inset-0 size-full object-contain"
+            className={cx('absolute inset-0 size-full', c.round ? 'object-cover' : 'object-contain')}
           />
         ) : (
           <button
@@ -317,9 +334,11 @@ function VideoContent({ m }: { m: Message }) {
             </span>
           </button>
         )}
-        <span className="absolute left-1.5 top-1.5 rounded-[7px] bg-black/55 px-[5px] py-[2px] text-[11px] font-medium tabular-nums text-white">
-          {durationLabel(c.duration ?? 0)}
-        </span>
+        {!fail && (
+          <span className="absolute left-1.5 top-1.5 rounded-[7px] bg-black/55 px-[5px] py-[2px] text-[11px] font-medium tabular-nums text-white">
+            {durationLabel(c.duration ?? 0)}
+          </span>
+        )}
         {!playing && !c.caption && <MetaOverlay m={m} />}
       </div>
       {c.caption && <MediaCaption m={m} caption={c.caption} />}
@@ -636,7 +655,7 @@ export const MessageRow = memo(function MessageRow({ id, ctx }: { id: string; ct
           className={cx(
             'relative text-[15px] leading-[19.5px] shadow-[0_0.5px_1px_rgba(0,0,0,0.04)]',
             out ? 'bubble-out' : 'bubble-in',
-            hasMedia || m.content.kind === 'sticker' ? 'p-[5px]' : 'px-[13px] py-[7px]',
+            hasMedia || m.content.kind === 'sticker' ? 'p-[3px]' : 'px-[13px] py-[7px]',
             m.content.kind === 'sticker' && '!bg-transparent !shadow-none',
             isDeleted && 'opacity-80',
           )}

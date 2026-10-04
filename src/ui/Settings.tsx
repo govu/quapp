@@ -517,7 +517,7 @@ function AboutSection() {
       <SectionTitle>About</SectionTitle>
       <div className="flex flex-col items-center py-6 text-center">
         <div className="grid size-[72px] place-items-center rounded-[18px] bg-gradient-to-b from-[#1EA9FF] to-[#0A6BFF] shadow-[0_8px_24px_rgba(10,107,255,0.35)]">
-          <svg width="38" height="38" viewBox="0 0 64 64"><path d="M32 13c-8.8 0-16 6.3-16 14 0 4.4 2.1 8.4 5.5 11L20 45l7.6-2.4c1.4.3 2.9.4 4.4.4 8.8 0 16-6.3 16-14S40.8 13 32 13z" fill="#fff" /></svg>
+          <svg width="38" height="38" viewBox="0 0 64 64" aria-hidden><circle cx="31" cy="30" r="14.5" fill="none" stroke="#fff" strokeWidth="5.5" /><path d="M40.5 39.5 48 47" stroke="#fff" strokeWidth="5.5" strokeLinecap="round" /></svg>
         </div>
         <div className="mt-3 text-[19px] font-semibold">Quapp</div>
         <div className="mt-0.5 text-[13px] text-[var(--label-2)]">Version 0.1.0</div>

@@ -92,8 +92,8 @@ export function Onboarding() {
           className="grid size-[68px] place-items-center rounded-[17px] bg-gradient-to-b from-[#1EA9FF] to-[#0A6BFF] shadow-[0_10px_30px_rgba(10,107,255,0.4)]"
         >
           <svg width="36" height="36" viewBox="0 0 64 64" aria-hidden>
-            <path d="M32 13c-8.8 0-16 6.3-16 14 0 4.4 2.1 8.4 5.5 11L20 45l7.6-2.4c1.4.3 2.9.4 4.4.4 8.8 0 16-6.3 16-14S40.8 13 32 13z" fill="#fff" />
-            <path d="M27 31l3.5-7 1.5 5 4-4-2.5 7-1.5-5z" fill="#0A6BFF" />
+            <circle cx="31" cy="30" r="14.5" fill="none" stroke="#fff" strokeWidth="5.5" />
+            <path d="M40.5 39.5 48 47" stroke="#fff" strokeWidth="5.5" strokeLinecap="round" />
           </svg>
         </motion.div>
 

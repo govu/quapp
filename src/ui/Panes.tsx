@@ -5,7 +5,7 @@ import {
   Archive, Bell, BellSlash, CaretDown, CaretUp, MagnifyingGlass, Phone, Prohibit, PushPin, Star, Trash, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
-import { cx, highlight, spring, timeLabel } from '../lib/util'
+import { cx, formatPhone, highlight, spring, timeLabel } from '../lib/util'
 import {
   doCallHandoff, doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doRejectCall, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, useStore,
 } from '../store'
@@ -225,7 +225,7 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
             </div>,
             document.body,
           )}
-          <div className="mt-3 text-[19px] font-semibold">{chat.kind === 'saved' ? 'You' : chat.title}</div>
+          <div className="mt-3 text-[19px] font-semibold">{chat.kind === 'saved' ? 'You' : formatPhone(chat.title)}</div>
           <div className="mt-0.5 text-[13.5px] text-[var(--label-2)]">
             {phone ?? (chat.kind === 'group' ? `Group · ${chat.participants.length} members` : chat.kind === 'channel' ? 'Channel' : '')}
           </div>

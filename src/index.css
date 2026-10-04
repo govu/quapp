@@ -61,8 +61,8 @@
   --menu-border: rgba(0, 0, 0, 0.08);
 
   /* selection */
-  --row-selected: rgba(0, 122, 255, 0.16);
   --row-hover: rgba(120, 120, 128, 0.09);
+  --row-selected: rgba(120, 120, 128, 0.16);
 
   /* wallpaper */
   --wall: #efeae2;
@@ -117,9 +117,8 @@
 
   --menu: rgba(44, 44, 48, 0.86);
   --menu-border: rgba(255, 255, 255, 0.09);
-
-  --row-selected: rgba(10, 132, 255, 0.28);
   --row-hover: rgba(120, 120, 128, 0.14);
+  --row-selected: rgba(120, 120, 128, 0.22);
 
   --wall: #0b0b0d;
   --wall-pattern: rgba(235, 235, 245, 0.045);
@@ -134,70 +133,60 @@
   --bubble-out-a: #33ce58;
   --bubble-out-b: #1fa643;
   --tick-read: #b8f5c5;
-  --row-selected: rgba(40, 189, 75, 0.15);
 }
 .dark[data-accent='green'] {
   --blue: #30d158;
   --bubble-out-a: #34d164;
   --bubble-out-b: #26b04f;
   --tick-read: #b8f5c5;
-  --row-selected: rgba(48, 209, 88, 0.24);
 }
 :root[data-accent='purple'] {
   --blue: #a64ce8;
   --bubble-out-a: #b45de0;
   --bubble-out-b: #9338d0;
   --tick-read: #e8c8ff;
-  --row-selected: rgba(166, 76, 232, 0.15);
 }
 .dark[data-accent='purple'] {
   --blue: #bf5af2;
   --bubble-out-a: #c468f5;
   --bubble-out-b: #a845dd;
   --tick-read: #eccdff;
-  --row-selected: rgba(191, 90, 242, 0.26);
 }
 :root[data-accent='pink'] {
   --blue: #f52f57;
   --bubble-out-a: #ff4d6f;
   --bubble-out-b: #e81f47;
   --tick-read: #ffc9d4;
-  --row-selected: rgba(245, 47, 87, 0.14);
 }
 .dark[data-accent='pink'] {
   --blue: #ff375f;
   --bubble-out-a: #ff5477;
   --bubble-out-b: #e52a4f;
   --tick-read: #ffc9d4;
-  --row-selected: rgba(255, 55, 95, 0.26);
 }
 :root[data-accent='orange'] {
   --blue: #f58a00;
   --bubble-out-a: #ffa31a;
   --bubble-out-b: #ee8200;
   --tick-read: #ffe1b3;
-  --row-selected: rgba(245, 138, 0, 0.15);
 }
 .dark[data-accent='orange'] {
   --blue: #ff9f0a;
   --bubble-out-a: #ffac26;
   --bubble-out-b: #f08c00;
   --tick-read: #ffe1b3;
-  --row-selected: rgba(255, 159, 10, 0.26);
 }
 :root[data-accent='teal'] {
   --blue: #1f9db3;
   --bubble-out-a: #30b9d1;
   --bubble-out-b: #128fa6;
   --tick-read: #bdf0fa;
-  --row-selected: rgba(31, 157, 179, 0.15);
 }
 .dark[data-accent='teal'] {
   --blue: #40c8e0;
   --bubble-out-a: #4acfe6;
   --bubble-out-b: #20a6bd;
   --tick-read: #c9f2fa;
-  --row-selected: rgba(64, 200, 224, 0.24);
 }
 
 html,
@@ -399,7 +388,8 @@ mark {
 
 /* link colors inside bubbles */
 .bubble-in a { color: var(--blue); }
-.bubble-out a { color: #fff; text-decoration: underline; }
+.bubble-out a { color: #fff; }
+.bubble-out a:not(.no-underline) { text-decoration: underline; }
 
 /* focus ring — Apple style, only for keyboard. Global default: EVERY
    interactive element gets it, not just opt-ins — rows, chips, menu items
@@ -411,6 +401,12 @@ mark {
 }
 input:focus-visible, textarea:focus-visible {
   outline-offset: 0;
+}
+/* inputs that signal focus themselves (composer border, palette sheet) don't
+   need the global 2px accent ring — it reads as a glitch, not feedback */
+.composer-input:focus-visible,
+.quiet-input:focus-visible {
+  outline: none;
 }
 
 input[type="text"], input[type="search"], textarea {

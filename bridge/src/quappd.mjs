@@ -199,7 +199,25 @@ try {
   for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
     const bucket = new Map()
     for (const { m, p } of arr) {
-      try { bucket.set(m.id, { proto: proto.WebMessageInfo.decode(Buffer.from(p, 'base64')), model: m }) } catch { /* bad blob */ }
+      try {
+        const decoded = proto.WebMessageInfo.decode(Buffer.from(p, 'base64'))
+        // models persisted before a mapping existed stay 'Unsupported message'
+        // forever; video models predate `poster`; stubs predate the full table —
+        // re-run conversion against the stored proto so fixes apply retroactively
+        const stale = (m?.content?.kind === 'system' && (m.content.text === 'Unsupported message' || m.content.text === 'System message'))
+          || ((m?.content?.kind === 'video' || m?.content?.kind === 'image') && m.content.poster === undefined)
+        if (stale) {
+          if (decoded.messageStubType != null) {
+            const text = stubText(decoded)
+            if (text && text !== 'System message' && text !== 'Unsupported message') m.content = { kind: 'system', text }
+          } else {
+            const inner = extractMessageContent(decoded.message)
+            const remapped = inner ? convertContent(m.chatId, m.id, inner) : null
+            if (remapped && !(remapped.kind === 'system' && remapped.text === 'Unsupported message')) m.content = remapped
+          }
+        }
+        bucket.set(m.id, { proto: decoded, model: m })
+      } catch { /* bad blob */ }
     }
     if (bucket.size) S.msgs.set(cid, bucket)
   }
@@ -515,9 +533,17 @@ function previewOf(raw) {
   const t = getContentType(inner)
   const c = inner[t] ?? {}
   return c.caption ?? c.text ?? c.conversation ?? ({
-    imageMessage: '📷 Photo', videoMessage: '📹 Video', audioMessage: '🎤 Voice message',
+    imageMessage: '📷 Photo', videoMessage: '📹 Video', ptvMessage: '📹 Video note',
+    audioMessage: c.ptt ? '🎤 Voice message' : '🎵 Audio',
     documentMessage: '📄 ' + (c.fileName ?? 'Document'), stickerMessage: 'Sticker',
-    locationMessage: '📍 Location', contactMessage: '👤 Contact', pollCreationMessage: '📊 Poll',
+    lottieStickerMessage: 'Animated sticker',
+    locationMessage: '📍 Location', liveLocationMessage: '📍 Live location',
+    contactMessage: '👤 Contact', contactsArrayMessage: '👤 Contacts',
+    pollCreationMessage: '📊 Poll', pollResultMessage: '📊 Poll results',
+    eventMessage: '📅 Event', groupInviteMessage: '👥 Group invite',
+    productMessage: '🛍️ Product', orderMessage: '🧾 Order',
+    buttonsMessage: c.contentText, listMessage: c.title,
+    interactiveMessage: c.body?.text ?? c.header?.title,
   }[t] ?? 'Message')
 }
 
@@ -532,12 +558,14 @@ function convertContent(chatId, id, inner) {
       if (c.title && c.matchedText) out.linkPreview = { url: c.matchedText, title: c.title, description: c.description }
       return out
     }
-    case 'imageMessage':
-      return { kind: 'image', url: mediaUrl(chatId, id), w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined }
+    case 'imageMessage': {
+      const poster = c.jpegThumbnail ? 'data:image/jpeg;base64,' + Buffer.from(c.jpegThumbnail).toString('base64') : undefined
+      return { kind: 'image', url: mediaUrl(chatId, id), poster, w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined }
+    }
     case 'videoMessage':
     case 'ptvMessage': { // round video notes share the video proto shape
       const poster = c.jpegThumbnail ? 'data:image/jpeg;base64,' + Buffer.from(c.jpegThumbnail).toString('base64') : undefined
-      return { kind: 'video', url: mediaUrl(chatId, id), poster, w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined, duration: c.seconds ?? 0 }
+      return { kind: 'video', url: mediaUrl(chatId, id), poster, w: c.width ?? 0, h: c.height ?? 0, caption: c.caption || undefined, duration: c.seconds ?? 0, round: type === 'ptvMessage' || undefined }
     }
     case 'audioMessage': {
       const wave = c.waveform ? [...c.waveform].map((b) => b / 255) : undefined
@@ -617,7 +645,43 @@ function convertContent(chatId, id, inner) {
       return { kind: 'poll', question: c.name ?? 'Poll', options: (c.options ?? []).map((o) => ({ text: o.optionName ?? '', votes: 0 })), multi: true }
     case 'botInvokeMessage':
       return { kind: 'system', text: '🤖 AI response' }
+    case 'albumMessage':
+      return { kind: 'system', text: '📷 Album' }
+    case 'eventCoverImageMessage':
+      return { kind: 'system', text: '📅 Event photo' }
+    case 'groupInviteMessage':
+    case 'inviteMessage':
+      return { kind: 'system', text: `👥 Group invite${c.groupName ? ' · ' + c.groupName : ''}` }
+    case 'pollResultMessage':
+    case 'pollResultSnapshotMessage':
+      return { kind: 'system', text: '📊 Poll results' }
+    case 'lottieStickerMessage':
+      return { kind: 'sticker', emoji: '✨', url: mediaUrl(chatId, id) }
+    case 'audioEditorMessage':
+      return { kind: 'audio', duration: 0, waveform: [], voice: false, file: mediaUrl(chatId, id) }
+    case 'encReactionMessage':
+    case 'encCommentMessage':
+      return { kind: 'system', text: '💬 Reaction' }
+    case 'paymentInviteMessage':
+    case 'requestPaymentMessage':
+    case 'requestPaymentSentMessage':
+    case 'declinePaymentRequestMessage':
+    case 'cancelPaymentRequestMessage':
+      return { kind: 'system', text: '💸 Payment' }
+    case 'keepInChatMessage':
+      return { kind: 'system', text: '📌 Kept message' }
+    case 'requestPhoneNumberMessage':
+      return { kind: 'system', text: '📱 Shared their number' }
+    case 'limitSharingMessage':
+      return { kind: 'system', text: '🔒 Limited sharing' }
+    case 'editedMessage': {
+      const inner2 = c.message ? extractMessageContent(c.message) : null
+      if (inner2) { const m2 = convertContent(chatId, id, inner2); if (m2) return { ...m2, edited: true } }
+      return { kind: 'text', text: '' }
+    }
     default:
+      // log the TYPE only — never the body — so unmapped protos are diagnosable
+      log('unmapped message type:', type)
       return { kind: 'system', text: 'Unsupported message' }
   }
 }
@@ -679,6 +743,10 @@ const STUB = {
   20: 'Group created',
   21: 'Group name changed',
   22: 'Group icon changed',
+  23: 'Group invite link reset',
+  24: 'Group description changed',
+  25: 'Group settings changed',
+  26: 'Group announce setting changed',
   27: 'A participant was added',
   28: 'A participant was removed',
   29: 'A participant was promoted to admin',
@@ -686,18 +754,37 @@ const STUB = {
   31: 'A participant joined via invite link',
   32: 'A participant left',
   33: 'A participant changed their number',
+  38: 'Security code changed',
   39: 'Messages are end-to-end encrypted',
   40: 'Missed voice call',
   41: 'Missed video call',
+  42: 'This contact changed their number',
+  43: 'Group deleted',
   45: 'Missed group voice call',
   46: 'Missed group video call',
   71: 'A participant joined via invite link',
+  72: 'Disappearing messages setting changed',
+  75: 'Messages are end-to-end encrypted',
   123: 'You joined this chat',
+  130: 'Disappearing messages turned on or off',
+  134: 'Group linked to a community',
+  136: 'Group added to a community',
+  137: 'Group removed from a community',
+  139: 'Group removed from a community',
+  142: 'Community created',
+  147: 'A participant was promoted to admin',
+  148: 'A participant was demoted',
+  149: 'Community deleted',
+  150: 'Group join requests changed',
+  158: 'Community name changed',
+  173: 'Community description changed',
+  176: 'Members can now add groups',
+  207: 'Community owner changed',
 }
 function stubText(raw) {
+  if (raw.messageStubType === 2) return 'Waiting for this message…' // CIPHERTEXT — undecryptable placeholder
   const t = STUB[raw.messageStubType]
   if (t === undefined) return 'System message'
-  if (raw.messageStubType === 2) return 'Waiting for this message…' // CIPHERTEXT — undecryptable placeholder
   return t
 }
 

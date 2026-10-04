@@ -5,7 +5,7 @@ import {
   ChatCircle, Checks, CircleHalf, Gear, MagnifyingGlass, Moon, Sun, User, X,
 } from '@phosphor-icons/react'
 import type { Message } from '../bridge/types'
-import { cx, highlight, spring, timeLabel } from '../lib/util'
+import { cx, formatPhone, highlight, spring, timeLabel } from '../lib/util'
 import {
   closeChat, jumpTo, markAllRead, openChat, openContactChat, setPalette, setPane, setSettingsOpen,
   updateSettings, useStore,
@@ -102,7 +102,7 @@ export const Palette = memo(function Palette() {
       out.push({
         key: `chat-${c.id}`, section: 'Chats',
         icon: <Avatar name={c.title} hue={c.avatarHue} url={c.avatarUrl} size={30} />,
-        title: l ? <Hl text={c.kind === 'saved' ? 'You' : c.title} q={q} /> : c.kind === 'saved' ? 'You' : c.title,
+        title: l ? <Hl text={c.kind === 'saved' ? 'You' : c.title} q={q} /> : c.kind === 'saved' ? 'You' : formatPhone(c.title),
         trailing: c.unread > 0 ? (
           <span className="grid h-[18px] min-w-[18px] place-items-center rounded-full bg-[var(--blue)] px-[5px] text-[10.5px] font-semibold text-white">{c.unread}</span>
         ) : undefined,
@@ -176,7 +176,7 @@ export const Palette = memo(function Palette() {
             role="dialog"
             aria-label="Command palette"
           >
-            <div className="flex items-center gap-3 border-b border-[var(--separator)] px-4">
+            <div className="flex items-center gap-3 border-b border-[var(--separator)] bg-[var(--fill-3)] px-4">
               <MagnifyingGlass size={18} className="shrink-0 text-[var(--label-3)]" />
               <input
                 ref={inputRef}
@@ -184,7 +184,7 @@ export const Palette = memo(function Palette() {
                 onChange={(e) => setQ(e.target.value)}
                 onKeyDown={onKey}
                 placeholder="Search chats, messages, people, actions…"
-                className="h-[52px] w-full bg-transparent text-[17px] outline-none placeholder:text-[var(--label-3)]"
+                className="quiet-input h-[52px] w-full bg-transparent text-[17px] outline-none placeholder:text-[var(--label-3)]"
                 aria-label="Command palette"
               />
               <button onClick={() => setPalette(false)} className="press rounded-full p-1 text-[var(--label-3)] hover:bg-[var(--fill-2)]" aria-label="Close">

@@ -5,7 +5,7 @@ import {
   Share, Trash, User, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat } from '../bridge/types'
-import { cx, listTime, sameDay, spring, timeLabel } from '../lib/util'
+import { cx, formatPhone, listTime, sameDay, spring, timeLabel } from '../lib/util'
 import {
   clearSelection, confirmClearChat, confirmDeleteChat, doCallHandoff, doDelete, doFlag, doMarkUnread, sendFiles, setForwarding, setPane, useStore,
 } from '../store'
@@ -136,7 +136,7 @@ function Header({ chat }: { chat: Chat }) {
       <button onClick={() => setPane(pane === 'info' ? null : 'info')} className="press no-drag flex min-w-0 items-center gap-3 rounded-lg py-1 pr-2 text-left" onContextMenu={menu}>
         <Avatar name={chat.title} hue={chat.avatarHue} url={chat.avatarUrl} size={36} />
         <div className="min-w-0">
-          <div className="truncate text-[15px] font-semibold leading-[19px]">{chat.kind === 'saved' ? 'You' : chat.title}</div>
+          <div className="truncate text-[15px] font-semibold leading-[19px]">{chat.kind === 'saved' ? 'You' : formatPhone(chat.title)}</div>
           <div className={cx('truncate text-[12px] leading-[15px]', typing?.length || online ? 'text-[var(--green)]' : 'text-[var(--label-3)]')}>
             {subtitle}
           </div>
@@ -231,7 +231,8 @@ function EmptyState() {
                 <stop offset="1" stopColor="#0a5ce0" />
               </linearGradient>
             </defs>
-            <path d="M32 12C20.4 12 11 20.4 11 30c0 5.2 2.7 10 7 13.1L16.5 52l8.6-2.7c2.2.6 4.5.9 6.9.9 11.6 0 21-8.4 21-18.2S43.6 12 32 12z" fill="url(#eg)" />
+            <circle cx="31" cy="30" r="15" fill="none" stroke="url(#eg)" strokeWidth="5.5" />
+            <path d="M40.5 39.5 48.5 47.5" stroke="url(#eg)" strokeWidth="5.5" strokeLinecap="round" />
           </svg>
         </div>
         <div className="mt-5 text-[22px] font-semibold tracking-[-0.01em]">Quapp</div>
