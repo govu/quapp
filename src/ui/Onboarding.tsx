@@ -53,6 +53,7 @@ export function Onboarding() {
   const qr = useStore((s) => s.qrString)
   const status = useStore((s) => s.bridgeStatus)
   const demoMode = useStore((s) => s.demoMode)
+  const syncing = useStore((s) => s.syncing)
   const [scanned, setScanned] = useState(false)
   const [seed, setSeed] = useState(1234567)
 
@@ -67,9 +68,11 @@ export function Onboarding() {
   const statusLine =
     status === 'error'
       ? { text: 'Cannot reach the Quapp bridge', tone: 'error' as const }
-      : qr
-        ? { text: 'Waiting for scan…', tone: 'idle' as const }
-        : { text: 'Connecting to WhatsApp…', tone: 'idle' as const }
+      : syncing
+        ? { text: `Syncing — ${syncing.chats} chats, ${syncing.messages.toLocaleString()} messages…`, tone: 'idle' as const }
+        : qr
+          ? { text: 'Waiting for scan…', tone: 'idle' as const }
+          : { text: 'Connecting to WhatsApp…', tone: 'idle' as const }
 
   return (
     <div className="vibrancy grid h-full place-items-center">

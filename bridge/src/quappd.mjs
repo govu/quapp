@@ -70,6 +70,7 @@ const S = {
   authState: null, // {state, saveCreds} reused across reconnects
   open: false,
   historyDone: false,
+  historySeen: false,
   me: null, // {id, name, phone}
   chats: new Map(), // jid -> Chat model
   contacts: new Map(), // jid -> Contact model
@@ -534,8 +535,10 @@ function applyGroupMeta(md) {
   if (!chat) return
   if (md.subject) chat.title = md.subject
   if (md.participants?.length) {
-    chat.participants = md.participants.map((p) => norm(p.id ?? p.jid))
-    chat.youAdmin = md.participants.some((p) => norm(p.id ?? p.jid) === ownJid() && !!p.admin)
+    // jid = real number, id = whatever the group addresses (lid-mode groups → @lid)
+    chat.participants = md.participants.map((p) => norm(p.jid ?? p.id))
+    const me = ownJid()
+    chat.youAdmin = md.participants.some((p) => (norm(p.jid ?? p.id) === me || norm(p.id) === me) && !!p.admin)
   }
   if (md.ephemeralDuration) chat.ephemeral = true
   emit({ type: 'chat_update', chat })
@@ -565,7 +568,7 @@ function onConn({ connection, lastDisconnect, qr }) {
     // pull groups so the chat list isn't empty, and emit what we have
     setTimeout(() => {
       if (!S.open) return
-      if (!S.historyDone && S.chats.size < 30) {
+      if (!S.historyDone && !S.historySeen && S.chats.size < 30) {
         // the phone never pushed the chat list — force a FULL app-state
         // resync by clearing the stored collection versions (return_snapshot
         // is only sent when a collection has no saved version). Replays every
@@ -645,6 +648,7 @@ function maybeReady() {
 }
 
 function onHistory({ chats, contacts, messages, syncType, isLatest }) {
+  S.historySeen = true
   for (const c of contacts ?? []) upsertContact(c)
   for (const c of chats ?? []) upsertChat(c)
   const arr = Array.isArray(messages) ? messages : Object.values(messages ?? {})
@@ -671,6 +675,9 @@ function onHistory({ chats, contacts, messages, syncType, isLatest }) {
   log(`history sync type=${syncType} latest=${!!isLatest}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
   maybeReady()
   // every chunk (incl. ON_DEMAND fetches) is a reason for the UI to resync
+  let total = 0
+  for (const b of S.msgs.values()) total += b.size
+  emit({ type: 'sync_progress', chats: S.chats.size, contacts: S.contacts.size, messages: total })
   emit({ type: 'history_done' })
   kickMetaQueue()
 }

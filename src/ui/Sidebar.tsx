@@ -154,6 +154,7 @@ export function Sidebar() {
   const showArchived = useStore((s) => s.showArchived)
   const activeChat = useStore((s) => s.activeChat)
   const account = useStore((s) => s.account)
+  const syncing = useStore((s) => s.syncing)
   const scrollRef = useRef<HTMLDivElement>(null)
   const [accountOpen, setAccountOpen] = useState(false)
 
@@ -297,6 +298,17 @@ export function Sidebar() {
           )
         })}
       </div>
+
+      {/* live history-sync indicator — keeps the user informed while the
+          phone pushes chats/messages so they don't think the app stalled */}
+      {syncing && (
+        <div className="mx-2 mb-1.5 flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-3 py-[7px] text-[12.5px] text-[var(--label-2)]">
+          <span className="size-3 animate-spin rounded-full border-2 border-[var(--blue)] border-t-transparent" />
+          <span className="truncate">
+            Syncing… {syncing.chats} chats · {syncing.messages.toLocaleString()} messages
+          </span>
+        </div>
+      )}
 
       {/* archived row */}
       {!showArchived && archivedCount > 0 && !query && (

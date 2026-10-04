@@ -48,6 +48,8 @@ interface State {
   chats: Map<Id, Chat>
   order: Id[]
   contacts: Map<Id, Contact>
+  /** live history-sync counters while chunks stream in */
+  syncing: { chats: number; contacts: number; messages: number } | null
   buckets: Map<Id, ChatBucket>
   typing: Map<Id, string[]>
   activeChat: Id | null
@@ -124,6 +126,7 @@ export const useStore = create<State>(() => ({
   chats: new Map(),
   order: [],
   contacts: new Map(),
+  syncing: null,
   buckets: new Map(),
   typing: new Map(),
   activeChat: null,
@@ -380,6 +383,10 @@ function applyEvent(e: ServerEvent) {
       retryBoot()
       break
     }
+    case 'sync_progress': {
+      patch({ syncing: { chats: e.chats, contacts: e.contacts, messages: e.messages } })
+      break
+    }
     case 'bridge_error': {
       toast(e.message, 'error')
       break
@@ -450,7 +457,7 @@ export function logout() {
   patch({
     phase: 'linking', account: null, chats: new Map(), order: [], buckets: new Map(),
     contacts: new Map(), activeChat: null, qrString: null, bridgeStatus: 'connecting',
-    selection: null, replyTo: null, editing: null, settingsOpen: false,
+    selection: null, replyTo: null, editing: null, settingsOpen: false, syncing: null,
   })
   adapter?.logout()
 }
