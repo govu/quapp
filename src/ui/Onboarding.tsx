@@ -54,14 +54,18 @@ export function Onboarding() {
   const status = useStore((s) => s.bridgeStatus)
   const demoMode = useStore((s) => s.demoMode)
   const syncing = useStore((s) => s.syncing)
-  const [scanned, setScanned] = useState(false)
+  const account = useStore((s) => s.account)
+  const [demoScanned, setDemoScanned] = useState(false)
   const [seed, setSeed] = useState(1234567)
+
+  // real scan: qr disappears once the phone accepts → confirmed connected
+  const scanned = demoMode ? demoScanned : (!qr && !!account)
 
   // demo mode: the pseudo-QR "rotates"; in real mode the daemon rotates it for us
   useEffect(() => {
     if (qr || !demoMode) return
     const refresh = setInterval(() => setSeed((s) => s + 1), 20000)
-    const scan = setTimeout(() => setScanned(true), 3200)
+    const scan = setTimeout(() => setDemoScanned(true), 3200)
     return () => { clearInterval(refresh); clearTimeout(scan) }
   }, [qr, demoMode])
 
@@ -70,9 +74,11 @@ export function Onboarding() {
       ? { text: 'Cannot reach the Quapp bridge', tone: 'error' as const }
       : syncing
         ? { text: `Syncing — ${syncing.chats} chats, ${syncing.messages.toLocaleString()} messages…`, tone: 'idle' as const }
-        : qr
-          ? { text: 'Waiting for scan…', tone: 'idle' as const }
-          : { text: 'Connecting to WhatsApp…', tone: 'idle' as const }
+        : scanned
+          ? { text: 'Connected! Loading your chats…', tone: 'idle' as const }
+          : qr
+            ? { text: 'Waiting for scan…', tone: 'idle' as const }
+            : { text: 'Connecting to WhatsApp…', tone: 'idle' as const }
 
   return (
     <div className="vibrancy grid h-full place-items-center">
@@ -136,7 +142,7 @@ export function Onboarding() {
               </AnimatePresence>
             </div>
             <AnimatePresence>
-              {scanned && !qr && demoMode && (
+              {scanned && !qr && (
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
