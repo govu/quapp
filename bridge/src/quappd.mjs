@@ -88,7 +88,17 @@ const S = {
   connecting: false,
   lastQr: null,
   backoff: 2000,
+  lastRx: 0,
 }
+
+// on-demand history state (ZapFast fetch_older/early_events) — declared here
+// because the durable-state restore below populates them at module load
+const pendingOlder = new Map() // chatId -> { asked: ts, explicit: bool }
+const historyStart = new Set() // phone said "nothing older" — never ask again
+const pendingReactions = new Map() // 'chatId:msgId' -> [{by, emoji, ts}]
+const removalPoint = new Map() // chatId -> ts(ms): deleted chats stay deleted
+const EARLY_MAX = 512
+const PHONE_PATIENCE = 90_000
 
 const FLAGS_FILE = path.join(DATA, 'flags.json')
 try {
@@ -136,6 +146,8 @@ function writeState() {
       contacts: [...S.contacts.values()],
       lidToPn: [...S.lidToPn],
       pushNames: [...S.pushNames],
+      historyStart: [...historyStart],
+      removalPoint: [...removalPoint],
       me: S.me,
       msgs,
     }
@@ -150,6 +162,8 @@ try {
   for (const c of st.contacts ?? []) S.contacts.set(c.id, c)
   for (const [k, v] of st.lidToPn ?? []) S.lidToPn.set(k, v)
   for (const [k, v] of st.pushNames ?? []) S.pushNames.set(k, v)
+  for (const j of st.historyStart ?? []) historyStart.add(j)
+  for (const [k, v] of st.removalPoint ?? []) removalPoint.set(k, v)
   S.me = st.me ?? null
   for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
     const bucket = new Map()
@@ -176,7 +190,8 @@ const respond = (ws, id, ok, resultOrErr) => {
 const norm = (jid) => jidNormalizedUser(jid ?? '')
 // strip the :device suffix — all chat/participant jids are device-less
 const ownJid = () => (S.me ? S.me.id.split(':')[0] + '@' + S.me.id.split('@')[1] : '')
-const msgsOf = (chatId) => S.msgs.get(chatId) ?? new Map()
+const msgsOf = (chatId) => S.msgs.get(chatId) ?? S.msgs.get(canonicalJid(chatId)) ?? new Map()
+const chatOf = (chatId) => S.chats.get(chatId) ?? S.chats.get(canonicalJid(chatId))
 const sortedMsgs = (chatId) => [...msgsOf(chatId).values()].map((e) => e.model).sort((a, b) => a.ts - b.ts)
 const enc = encodeURIComponent
 const hue = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360 }
@@ -188,6 +203,69 @@ const contactName = (jid) => {
 }
 // LIDs are privacy aliases — resolve to the real phone jid when we know it
 const resolveJid = (jid) => jid.endsWith('@lid') ? (S.lidToPn.get(jid) ?? jid) : jid
+// canonical filing id for anything arriving as a jid (ZapFast Worker::canonical):
+// a chat behind a privacy id is archived under its phone number once known
+const canonicalJid = (jid) => resolveJid(jid)
+
+// ZapFast learn_lid — one mapping learned → refile the chat under the number
+function learnLid(lid, pn) {
+  lid = norm(lid); pn = norm(pn)
+  if (!lid?.endsWith('@lid') || !pn?.endsWith('@s.whatsapp.net') || lid === pn) return
+  if (S.lidToPn.get(lid) === pn) return
+  S.lidToPn.set(lid, pn)
+  markDirty()
+  rekeyChat(lid, pn)
+  retitleChats()
+}
+
+// message keys carry LID↔PN pairs (ZapFast learn_source: sender_alt /
+// recipient_alt) — Baileys surfaces them as key.{sender,participant}{Lid,Pn}
+function learnFromKey(key) {
+  if (!key) return
+  if (key.senderLid && key.senderPn) learnLid(key.senderLid, key.senderPn)
+  if (key.participantLid && key.participantPn) learnLid(key.participantLid, key.participantPn)
+}
+
+// move a privacy-id chat under its phone number: merge messages, unread,
+// metadata — ZapFast rekeys early events too; ours settle via pendingReactions
+function rekeyChat(lid, pn) {
+  const lc = S.chats.get(lid)
+  const pc = S.chats.get(pn)
+  if (lc) {
+    if (pc) {
+      pc.unread += lc.unread
+      pc.lastActivity = Math.max(pc.lastActivity ?? 0, lc.lastActivity ?? 0)
+      pc.pinned ||= lc.pinned; pc.muted ||= lc.muted; pc.archived ||= lc.archived
+      if (!pc.title || pc.title.startsWith('+') || pc.title === 'WhatsApp user') pc.title = lc.title
+      S.chats.delete(lid)
+    } else {
+      lc.id = pn
+      S.chats.delete(lid)
+      S.chats.set(pn, lc)
+    }
+    emit({ type: 'chat_removed', chatId: lid })
+    emit({ type: 'chat_update', chat: S.chats.get(pn) })
+  }
+  const lb = S.msgs.get(lid)
+  if (lb?.size) {
+    const pb = msgsOf(pn)
+    for (const [id, e] of lb) {
+      e.model.chatId = pn
+      if (e.proto?.key) e.proto.key.remoteJid = pn
+      if (!pb.has(id)) pb.set(id, e)
+    }
+    S.msgs.delete(lid)
+    S.msgs.set(pn, pb)
+    // the renderer owns a bucket under the old id — force a fresh snapshot
+    emit({ type: 'history_done' })
+  }
+  // pending early events filed under the privacy id follow the chat
+  for (const [k, q] of pendingReactions) {
+    if (!k.startsWith(lid + ':')) continue
+    pendingReactions.delete(k)
+    pendingReactions.set(pn + ':' + k.slice(lid.length + 1), q)
+  }
+}
 const displayName = (jid) => {
   jid = norm(jid)
   if (jid === ownJid()) return 'You'
@@ -208,7 +286,7 @@ function upsertContact(raw) {
   // Baileys gives { id, lid } pairs — index under both so @lid chats resolve
   const lid = raw.lid ? norm(raw.lid) : null
   if (lid && lid !== jid) {
-    S.lidToPn.set(lid, jid)
+    learnLid(lid, jid)
     const lc = S.contacts.get(lid) ?? {}
     S.contacts.set(lid, { ...lc, id: lid, linkedJid: jid })
   }
@@ -253,9 +331,9 @@ function chatKind(jid) {
 }
 
 function upsertChat(raw) {
-  const jid = norm(raw.id)
+  const jid = canonicalJid(norm(raw.id))
   if (!jid || isJidBroadcast(jid)) return
-  const prev = S.chats.get(jid)
+  const prev = chatOf(jid)
   const kind = chatKind(jid)
   const chat = {
     id: jid,
@@ -369,7 +447,7 @@ function convertContent(chatId, id, inner) {
 function toModel(raw) {
   const key = raw.key
   if (!key?.remoteJid || !key?.id) return null
-  const chatId = norm(key.remoteJid)
+  const chatId = canonicalJid(norm(key.remoteJid))
   const inner = extractMessageContent(raw.message)
   if (!inner) return null
   const type = getContentType(inner)
@@ -409,7 +487,7 @@ function baseModel(raw, chatId, content) {
     id: raw.key.id,
     chatId,
     from,
-    fromName: fromMe ? undefined : (raw.pushName ?? contactName(from) ?? (S.chats.get(chatId)?.kind === 'dm' ? undefined : displayName(from))),
+    fromName: fromMe ? undefined : (raw.pushName ?? contactName(from) ?? (chatOf(chatId)?.kind === 'dm' ? undefined : displayName(from))),
     ts: Number(raw.messageTimestamp ?? Date.now() / 1000) * 1000,
     delivery: fromMe ? STATUS[raw.status ?? 2] ?? 'sent' : undefined,
     starred: !!raw.starred || S.flags.starred.has(chatId + '' + raw.key.id),
@@ -442,14 +520,27 @@ function storeRaw(raw, model) {
   }
   bucket.set(model.id, { proto: raw, model })
   markDirty()
-  const chat = S.chats.get(model.chatId)
+  // early events: reactions filed while the message was still missing
+  const early = pendingReactions.get(model.chatId + ':' + model.id)
+  if (early?.length) {
+    pendingReactions.delete(model.chatId + ':' + model.id)
+    const byReactor = new Map()
+    for (const r of early.sort((a, b) => a.ts - b.ts)) {
+      if (r.emoji) byReactor.set(r.by, r.emoji)
+      else byReactor.delete(r.by)
+    }
+    const merged = (model.reactions ?? []).filter((x) => !byReactor.has(x.by))
+    for (const [by, emoji] of byReactor) merged.push({ emoji, by })
+    model.reactions = merged.length ? merged : undefined
+  }
+  const chat = chatOf(model.chatId)
   if (chat) chat.lastActivity = Math.max(chat.lastActivity, model.ts)
   // learn pushNames from messages — the only name source for @lid contacts
-  const sender = norm(raw.key?.participant ?? raw.key?.remoteJid ?? '')
+  const sender = canonicalJid(norm(raw.key?.participant ?? raw.key?.remoteJid ?? ''))
   if (raw.pushName && sender && sender !== ownJid()) {
     S.pushNames.set(sender, raw.pushName)
     // a DM titled '+'+digits or 'WhatsApp user' upgrades to the real name
-    const dc = S.chats.get(sender)
+    const dc = chatOf(sender)
     if (dc && (dc.title.startsWith('+') || dc.title === 'WhatsApp user')) {
       dc.title = raw.pushName
       emit({ type: 'chat_update', chat: dc })
@@ -484,6 +575,10 @@ async function ensureSocket() {
       shouldIgnoreJid: (jid) => isJidBroadcast(jid),
     })
     S.sock = sock
+    // every decoded frame counts — keepalive answers keep this alive, so a
+    // long silence means a wedged link, not an idle one (ZapFast link_watch)
+    S.lastRx = Date.now()
+    sock.ws?.on?.('frame', () => { S.lastRx = Date.now() })
     // ignore events from a socket that was replaced (logout / overlapping
     // reconnects) — they would null out live state and write stale creds
     const safe = (fn) => (...a) => {
@@ -497,8 +592,10 @@ async function ensureSocket() {
     sock.ev.on('chats.update', safe(onChatsUpdate))
     sock.ev.on('chats.delete', safe((jids) => {
       for (const j of jids) {
-        const chatId = norm(j)
+        const chatId = canonicalJid(norm(j))
         S.chats.delete(chatId); S.msgs.delete(chatId)
+        // tombstone: history replaying older messages must not resurrect it
+        removalPoint.set(chatId, Date.now()); markDirty()
         emit({ type: 'chat_removed', chatId })
       }
     }))
@@ -511,7 +608,7 @@ async function ensureSocket() {
     sock.ev.on('groups.update', safe((mds) => { for (const md of mds ?? []) applyGroupMeta(md) }))
     sock.ev.on('groups.upsert', safe((mds) => { for (const md of mds ?? []) applyGroupMeta(md) }))
     sock.ev.on('group-participants.update', safe(({ id, participants, action }) => {
-      const jid = norm(id); const chat = S.chats.get(jid)
+      const jid = norm(id); const chat = chatOf(jid)
       if (!chat) return
       const who = new Set((participants ?? []).map(norm))
       if (action === 'remove') chat.participants = chat.participants.filter((p) => !who.has(p))
@@ -531,7 +628,7 @@ async function ensureSocket() {
 
 function applyGroupMeta(md) {
   const jid = norm(md.id)
-  const chat = S.chats.get(jid) ?? upsertChat({ id: jid })
+  const chat = chatOf(jid) ?? upsertChat({ id: jid })
   if (!chat) return
   if (md.subject) chat.title = md.subject
   if (md.participants?.length) {
@@ -544,7 +641,7 @@ function applyGroupMeta(md) {
   emit({ type: 'chat_update', chat })
   for (const p of md.participants ?? []) {
     // participants carry both identities — {id: as-sent, jid: pn, lid: @lid}
-    if (p.lid && p.jid) S.lidToPn.set(norm(p.lid), norm(p.jid))
+    if (p.lid && p.jid) learnLid(p.lid, p.jid)
     upsertContact({ id: p.jid ?? p.id })
   }
   // once the LID map grows, unresolved chat titles may now resolve — emit updates
@@ -595,15 +692,18 @@ function onConn({ connection, lastDisconnect, qr }) {
           })
           .catch((e) => log('group fetch failed:', e?.message))
       }
-      // discovery: probe synced contacts for on-demand history to rebuild
-      // the DM list when the initial history push never arrived
+      // discovery: probe contacts AND known-but-empty chats for on-demand
+      // history (ZapFast: a chat that synced with a name and no messages gets
+      // asked as soon as it loads or opens — we ask in bulk once)
       setTimeout(() => {
         if (!S.open) return
         const known = new Set(S.chats.keys())
-        const candidates = [...S.contacts.keys()]
-          .filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j))
-          .slice(0, 150)
-        log(`contact discovery: ${candidates.length} candidates`)
+        const emptyChats = [...known].filter((j) => !msgsOf(j).size && (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')))
+        const candidates = [
+          ...emptyChats,
+          ...[...S.contacts.keys()].filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j)),
+        ].slice(0, 150)
+        log(`contact discovery: ${candidates.length} candidates (${emptyChats.length} empty chats)`)
         if (!candidates.length) return
         let i = 0
         const tick = () => {
@@ -624,6 +724,7 @@ function onConn({ connection, lastDisconnect, qr }) {
       S.me = null
       S.historyDone = false
       readyEmitted = false
+      syncEndEmitted = false
       S.authState = null // in-memory creds are dead too — never reuse them
       S.chats.clear(); S.msgs.clear(); S.contacts.clear()
       S.lidToPn.clear(); S.pushNames.clear()
@@ -639,7 +740,19 @@ function onConn({ connection, lastDisconnect, qr }) {
   }
 }
 
+// silence watchdog (ZapFast SILENCE_LIMIT=120s): WhatsApp's keepalive pings
+// every ~30s, so zero frames for 150s while 'open' means the link is wedged —
+// a write into it can hang forever and no close event ever arrives
+setInterval(() => {
+  if (!S.open || !S.sock) return
+  const quiet = Date.now() - (S.lastRx ?? 0)
+  if (quiet < 150_000) return
+  log(`link silent for ${Math.round(quiet / 1000)}s — reconnecting`)
+  try { S.sock.end?.(undefined) } catch { /* dead */ }
+}, 30_000)
+
 let readyEmitted = false
+let syncEndEmitted = false
 function maybeReady() {
   if (!S.open) return
   readyEmitted = true
@@ -647,16 +760,31 @@ function maybeReady() {
   for (const w of waiters) w()
 }
 
-function onHistory({ chats, contacts, messages, syncType, isLatest }) {
+function onHistory({ chats, contacts, messages, syncType, isLatest, progress, peerDataRequestSessionId }) {
   S.historySeen = true
+  // ON_DEMAND answers pending fetchMessageHistory requests (ZapFast:
+  // sync_type == ON_DEMAND || peer_data_request_session_id.is_some())
+  const onDemand = syncType === 6 || peerDataRequestSessionId != null
+  const filed = new Map() // chatId -> count stored this chunk
   for (const c of contacts ?? []) upsertContact(c)
-  for (const c of chats ?? []) upsertChat(c)
+  const chatMore = new Map() // chatId -> endOfHistoryTransferType
+  for (const c of chats ?? []) {
+    const jid = canonicalJid(norm(c.id))
+    // ZapFast removal_point: a chat deleted locally stays deleted — replayed
+    // history only resurrects it if it carries newer activity
+    const through = removalPoint.get(jid)
+    const chatTs = c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : 0
+    if (through && chatTs <= through && !S.chats.has(jid)) continue
+    upsertChat(c)
+    if (c.endOfHistoryTransferType != null) chatMore.set(jid, c.endOfHistoryTransferType)
+  }
   const arr = Array.isArray(messages) ? messages : Object.values(messages ?? {})
   let n = 0
   for (const raw of arr) {
+    learnFromKey(raw.key)
     // history replays reactions / poll votes / protocol msgs too — apply them
     // to their targets instead of rendering "Unsupported message" rows
-    const jid = norm(raw.key?.remoteJidAlt ?? raw.key?.remoteJid)
+    const jid = canonicalJid(norm(raw.key?.remoteJid))
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
     if (t === 'reactionMessage') { applyReaction(raw, inner.reactionMessage); continue }
@@ -669,23 +797,37 @@ function onHistory({ chats, contacts, messages, syncType, isLatest }) {
     }
     if (t === 'senderKeyDistributionMessage' || t === 'keepInChatMessage') continue
     const model = toModel(raw)
-    if (model) { storeRaw(raw, model); n++ }
+    if (model) {
+      const through = removalPoint.get(model.chatId)
+      if (through) {
+        if (model.ts > through) removalPoint.delete(model.chatId) // newer activity reopens the chat
+        else continue // replayed pre-deletion message — stays deleted
+      }
+      storeRaw(raw, model); n++
+      filed.set(model.chatId, (filed.get(model.chatId) ?? 0) + 1)
+    }
   }
-  if (isLatest || syncType === 0 || syncType === 7) S.historyDone = true // FULL_BOOTSTRAP / latest / NO_HISTORY
-  log(`history sync type=${syncType} latest=${!!isLatest}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
+  if (!onDemand && (isLatest || syncType === 0 || syncType === 7)) S.historyDone = true
+  log(`history sync type=${syncType} latest=${!!isLatest} progress=${progress ?? '-'}: ${chats?.length ?? 0} chats, ${contacts?.length ?? 0} contacts, ${arr.length} messages (${n} stored)`)
+  if (onDemand) {
+    const counts = new Map(filed)
+    for (const jid of chatMore.keys()) if (!counts.has(jid)) counts.set(jid, 0)
+    answerOlder([...counts.entries()].map(([jid, count]) => [jid, count, chatMore.get(jid)]))
+  }
   maybeReady()
   // every chunk (incl. ON_DEMAND fetches) is a reason for the UI to resync
   let total = 0
   for (const b of S.msgs.values()) total += b.size
-  emit({ type: 'sync_progress', chats: S.chats.size, contacts: S.contacts.size, messages: total })
+  emit({ type: 'sync_progress', chats: S.chats.size, contacts: S.contacts.size, messages: total, progress: progress ?? null })
+  if (S.historyDone && !syncEndEmitted) { syncEndEmitted = true; emit({ type: 'sync_progress', done: true, chats: S.chats.size, contacts: S.contacts.size, messages: total }) }
   emit({ type: 'history_done' })
   kickMetaQueue()
 }
 
 function onChatsUpdate(updates) {
   for (const u of updates) {
-    const jid = norm(u.id)
-    const chat = S.chats.get(jid)
+    const jid = canonicalJid(norm(u.id))
+    const chat = chatOf(jid)
     if (!chat) { const m = upsertChat(u); if (m) emit({ type: 'chat_update', chat: m }); continue }
     if (u.name) chat.title = u.name
     if (u.unreadCount != null) chat.unread = u.unreadCount
@@ -704,7 +846,8 @@ function onChatsUpdate(updates) {
 
 function onMessages({ messages, type }) {
   for (const raw of messages) {
-    const jid = norm(raw.key?.remoteJidAlt ?? raw.key?.remoteJid)
+    learnFromKey(raw.key)
+    const jid = canonicalJid(norm(raw.key?.remoteJid))
     if (!jid || isJidBroadcast(jid)) continue
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
@@ -722,11 +865,16 @@ function onMessages({ messages, type }) {
 
     const model = toModel(raw)
     if (!model) continue
+    const through = removalPoint.get(jid)
+    if (through) {
+      if (model.ts > through) removalPoint.delete(jid)
+      else if (type !== 'notify') continue // old replay — chat stays deleted
+    }
     const isNewChat = !S.chats.has(jid)
     if (isNewChat) upsertChat({ id: jid })
     storeRaw(raw, model)
 
-    const chat = S.chats.get(jid)
+    const chat = chatOf(jid)
     if (type === 'notify') {
       if (chat) { chat.unread = model.from === 'me' ? chat.unread : chat.unread + 1; chat.lastActivity = model.ts }
       emit({ type: 'message', msg: model })
@@ -740,12 +888,26 @@ function onMessages({ messages, type }) {
   }
 }
 
+// reactions that arrive before their message (ZapFast early_events) wait in
+// pendingReactions — history replays reactions before targets, and phone
+// reads can precede the message itself
+function queueReaction(chatId, targetId, reactor, emoji, ts) {
+  const k = chatId + ':' + targetId
+  if (!pendingReactions.has(k) && pendingReactions.size >= EARLY_MAX) {
+    pendingReactions.delete(pendingReactions.keys().next().value)
+  }
+  const q = pendingReactions.get(k) ?? []
+  const i = q.findIndex((x) => x.by === reactor)
+  if (i >= 0) { if (q[i].ts <= ts) q[i] = { by: reactor, emoji, ts } } else q.push({ by: reactor, emoji, ts })
+  pendingReactions.set(k, q)
+}
+
 function applyReaction(raw, r) {
-  const chatId = norm(raw.key.remoteJid)
+  const chatId = canonicalJid(norm(raw.key.remoteJid))
   const targetId = r.key?.id
   const entry = msgsOf(chatId).get(targetId)
-  if (!entry) return
-  const reactor = raw.key.fromMe ? 'me' : norm(raw.key.participant ?? raw.key.remoteJid)
+  const reactor = raw.key.fromMe ? 'me' : canonicalJid(norm(raw.key.participant ?? raw.key.remoteJid))
+  if (!entry) { queueReaction(chatId, targetId, reactor, r.text ?? '', Number(raw.messageTimestamp ?? 0)); return }
   const list = (entry.model.reactions ?? []).filter((x) => x.by !== reactor)
   if (r.text) list.push({ emoji: r.text, by: reactor })
   entry.model.reactions = list.length ? list : undefined
@@ -753,7 +915,7 @@ function applyReaction(raw, r) {
 }
 
 async function applyPollUpdate(raw, p) {
-  const chatId = norm(raw.key.remoteJid)
+  const chatId = canonicalJid(norm(raw.key.remoteJid))
   const entry = msgsOf(chatId).get(p.pollCreationMessageKey?.id)
   if (!entry || entry.model.content.kind !== 'poll') return
   try {
@@ -772,7 +934,7 @@ async function applyPollUpdate(raw, p) {
 }
 
 function applyEdit(raw, p) {
-  const chatId = norm(raw.key.remoteJid)
+  const chatId = canonicalJid(norm(raw.key.remoteJid))
   const entry = msgsOf(chatId).get(p.key?.id)
   if (!entry) return
   const inner = extractMessageContent(p.editedMessage)
@@ -783,7 +945,7 @@ function applyEdit(raw, p) {
 }
 
 function applyRevoke(chatId, id) {
-  const entry = msgsOf(chatId).get(id)
+  const entry = msgsOf(canonicalJid(chatId)).get(id)
   if (!entry) return
   entry.model.content = { kind: 'deleted' }
   entry.model.reactions = undefined
@@ -792,7 +954,7 @@ function applyRevoke(chatId, id) {
 
 function onMessagesUpdate(updates) {
   for (const { key, update } of updates) {
-    const chatId = norm(key.remoteJid)
+    const chatId = canonicalJid(norm(key.remoteJid))
     if (update?.message?.protocolMessage?.type === 14) { applyEdit({ key }, update.message.protocolMessage); continue }
     if (update?.message?.protocolMessage?.type === 0) { applyRevoke(chatId, update.message.protocolMessage.key?.id); continue }
     if (update?.pollUpdates?.length) {
@@ -852,7 +1014,7 @@ function onPresence({ id, presences }) {
       if (m?.delete(pjid)) emit({ type: 'typing', chatId, names: [...m.keys()].map(displayName) })
     }
     if (state === 'unavailable' && p.lastSeen != null) {
-      const c = S.chats.get(chatId)
+      const c = chatOf(chatId)
       if (c) { c.lastSeen = Number(p.lastSeen) * 1000; emit({ type: 'chat_update', chat: c }) }
     }
   }
@@ -903,7 +1065,7 @@ function queueNewsMeta(jid) {
     try {
       const md = await S.sock.newsletterMetadata('jid', jid)
       const name = md?.thread_metadata?.name?.text ?? md?.name?.text ?? md?.name
-      const chat = S.chats.get(jid)
+      const chat = chatOf(jid)
       if (name && chat && chat.title !== name) {
         chat.title = name
         emit({ type: 'chat_update', chat })
@@ -918,39 +1080,61 @@ async function kickMetaQueue() {
   metaRunning = true
   while (metaQueue.length && S.open) {
     await metaQueue.shift()()
-    await sleep(350)
+    await sleep(800) // ZapFast paces metadata at ~2/5s — bursts hit rate limits
   }
   metaRunning = false
 }
 
-// ---------- on-demand history (ZapFast-style: ask the phone when a chat
-// loads empty — mirrors "anchor at the present with an empty message id") ----------
-const requestedHistory = new Set()
-async function requestHistory(chatId, count = 80) {
-  const jid = norm(chatId)
+// ---------- on-demand history (ZapFast fetch_older: anchor at the oldest
+// archived message, or at the present with an empty id for empty chats) ----
+// The wire field is named ...TimestampMs but the phone reads UNIX SECONDS —
+// whatsmeow found it the hard way; multiplying by 1_000 lands in year ~56000
+// and the phone silently never answers (ZapFast AGENTS.md warns the same).
+async function requestHistory(chatId, count = 80, explicit = false) {
+  const jid = canonicalJid(norm(chatId))
   if (!S.open || !jid || !S.sock?.fetchMessageHistory) return false
+  if (historyStart.has(jid)) return false
+  const prev = pendingOlder.get(jid)
+  if (prev) { if (explicit) prev.explicit = true; return false }
   const bucket = msgsOf(jid)
   const oldest = bucket.size
     ? [...bucket.values()].reduce((a, b) => (Number(a.proto.messageTimestamp) < Number(b.proto.messageTimestamp) ? a : b))
     : null
-  const key = oldest?.proto?.key ?? { remoteJid: jid, id: '', fromMe: false }
-  const tsMs = oldest ? Number(oldest.proto.messageTimestamp) * 1000 : Date.now()
-  const tag = `${jid}:${key.id || 'head'}`
-  if (requestedHistory.has(tag)) return false
-  requestedHistory.add(tag)
-  // if the phone is offline the answer simply never comes — let the request
-  // be retried instead of deduped forever
-  setTimeout(() => requestedHistory.delete(tag), 60_000)
+  const key = oldest?.proto?.key
+    ? { remoteJid: jid, id: oldest.proto.key.id, fromMe: !!oldest.proto.key.fromMe }
+    : { remoteJid: jid, id: '', fromMe: false }
+  // messageTimestamp is already seconds; empty chats anchor at "now"
+  const ts = oldest ? Number(oldest.proto.messageTimestamp) : Math.floor(Date.now() / 1000)
+  pendingOlder.set(jid, { asked: Date.now(), explicit })
   try {
-    await S.sock.fetchMessageHistory(count, key, tsMs)
-    log(`history request sent (${count} msgs)`)
+    await S.sock.fetchMessageHistory(count, key, ts)
+    log(`history request ${jid === chatId ? '' : '(lid→pn) '}sent (${count} msgs, anchor ${key.id || 'present'})`)
     return true
   } catch (e) {
-    requestedHistory.delete(tag)
+    pendingOlder.delete(jid)
     log(`history request failed: ${e?.message}`)
     return false
   }
 }
+
+// ON_DEMAND chunks resolve pending requests (ZapFast answer_older)
+function answerOlder(fileCounts) {
+  for (const [jid, n, moreOnPhone] of fileCounts) {
+    if (moreOnPhone === 1) historyStart.add(jid) // COMPLETE_AND_NO_MORE...
+    pendingOlder.delete(jid)
+    emit({ type: 'older_result', chatId: jid, count: n, hasMore: n > 0 && moreOnPhone !== 1 })
+  }
+}
+
+// unanswered requests expire — explicit (user scroll) retries quietly
+setInterval(() => {
+  const now = Date.now()
+  for (const [jid, req] of pendingOlder) {
+    if (now - req.asked < PHONE_PATIENCE) continue
+    pendingOlder.delete(jid)
+    emit({ type: 'older_result', chatId: jid, count: 0, hasMore: true })
+  }
+}, 15000)
 
 // ---------- snapshot ----------
 function snapshot() {
@@ -991,7 +1175,10 @@ const CMDS = {
     S.me = null
     S.historyDone = false
     readyEmitted = false
-    requestedHistory.clear()
+    syncEndEmitted = false
+    pendingOlder.clear()
+    historyStart.clear()
+    pendingReactions.clear()
     S.subscribedPresence.clear()
     S.typingTimers.clear()
     S.chats.clear(); S.msgs.clear(); S.contacts.clear()
@@ -1010,16 +1197,18 @@ const CMDS = {
   },
 
   async loadOlder({ chatId, beforeTs, limit }) {
-    const arr = sortedMsgs(chatId)
+    const jid = canonicalJid(norm(chatId))
+    const arr = sortedMsgs(jid)
     if (!arr.length) {
       // phone holds the history — ask for it; arrives as ON_DEMAND history.set
-      void requestHistory(chatId, 100)
+      if (historyStart.has(jid)) return { messages: [], hasMore: false }
+      void requestHistory(jid, 100, true)
       return { messages: [], hasMore: true }
     }
     const idx = arr.findIndex((m) => m.ts >= beforeTs)
     const end = idx === -1 ? arr.length : idx
     const start = Math.max(0, end - limit)
-    const asked = start === 0 && requestHistory(chatId, 100)
+    const asked = start === 0 && !historyStart.has(jid) && (await requestHistory(jid, 100, true))
     return { messages: arr.slice(start, end), hasMore: start > 0 || !!asked }
   },
 
@@ -1050,7 +1239,7 @@ const CMDS = {
       const model = toModel(sent) ?? baseModel(sent, jid, { kind: 'text', text: '' })
       model.delivery = 'pending'
       storeRaw(sent, model)
-      const chat = S.chats.get(jid)
+      const chat = chatOf(jid)
       if (chat) { chat.lastActivity = model.ts; emit({ type: 'chat_update', chat }) }
       emit({ type: 'message', msg: model })
     }
@@ -1135,7 +1324,7 @@ const CMDS = {
 
   async openChat({ contactId }) {
     const jid = norm(contactId.includes('@') ? contactId : contactId + '@s.whatsapp.net')
-    let chat = S.chats.get(jid)
+    let chat = chatOf(jid)
     if (!chat) {
       chat = upsertChat({ id: jid })
       emit({ type: 'chat_update', chat })
@@ -1156,7 +1345,7 @@ const CMDS = {
       S.subscribedPresence.add(jid)
       void S.sock?.presenceSubscribe(jid).catch(() => {})
     }
-    const chat = S.chats.get(chatId)
+    const chat = chatOf(chatId)
     if (chat) {
       chat.unread = 0
       chat.markedUnread = false
@@ -1164,10 +1353,12 @@ const CMDS = {
       saveFlags()
       emit({ type: 'chat_update', chat })
     }
+    // ZapFast: a chat that opened with no local messages asks the phone
+    if (!msgsOf(jid).size) void requestHistory(jid, 80, true)
   },
 
   async markUnread({ chatId, value }) {
-    const chat = S.chats.get(chatId)
+    const chat = chatOf(chatId)
     if (!chat) return
     chat.markedUnread = !!value
     value ? S.flags.unread.add(chatId) : S.flags.unread.delete(chatId)
@@ -1180,7 +1371,7 @@ const CMDS = {
   },
 
   async setChatFlag({ chatId, flag, value }) {
-    const chat = S.chats.get(chatId)
+    const chat = chatOf(chatId)
     if (!chat) return
     const jid = norm(chatId)
     try {
@@ -1233,7 +1424,7 @@ const CMDS = {
 
   async leaveGroup({ chatId }) {
     await S.sock.groupLeave(norm(chatId))
-    const chat = S.chats.get(norm(chatId))
+    const chat = chatOf(norm(chatId))
     if (chat) { S.chats.delete(norm(chatId)); emit({ type: 'chat_update', chat: { ...chat, kind: 'dm', title: chat.title + ' (left)' } }) }
     return { ok: true }
   },
@@ -1243,7 +1434,7 @@ const CMDS = {
     if (!key) return { error: 'not found' }
     try {
       await S.sock.sendMessage(norm(chatId), { pin: key, type: pin ? 1 : 2, time: 604800 })
-      const chat = S.chats.get(norm(chatId))
+      const chat = chatOf(norm(chatId))
       if (chat) {
         chat.pinnedMessageId = pin ? messageId : undefined
         emit({ type: 'chat_update', chat })

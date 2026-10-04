@@ -305,7 +305,7 @@ export function Sidebar() {
         <div className="mx-2 mb-1.5 flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-3 py-[7px] text-[12.5px] text-[var(--label-2)]">
           <span className="size-3 animate-spin rounded-full border-2 border-[var(--blue)] border-t-transparent" />
           <span className="truncate">
-            Syncing… {syncing.chats} chats · {syncing.messages.toLocaleString()} messages
+            Syncing{syncing.progress != null ? ` ${syncing.progress}%` : '…'} {syncing.chats} chats · {syncing.messages.toLocaleString()} messages
           </span>
         </div>
       )}

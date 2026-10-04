@@ -49,7 +49,7 @@ interface State {
   order: Id[]
   contacts: Map<Id, Contact>
   /** live history-sync counters while chunks stream in */
-  syncing: { chats: number; contacts: number; messages: number } | null
+  syncing: { chats: number; contacts: number; messages: number; progress?: number } | null
   buckets: Map<Id, ChatBucket>
   typing: Map<Id, string[]>
   activeChat: Id | null
@@ -383,8 +383,19 @@ function applyEvent(e: ServerEvent) {
       retryBoot()
       break
     }
+    case 'older_result': {
+      // the phone answered an on-demand history request — no more "maybe"
+      const { buckets } = get()
+      const b = buckets.get(e.chatId)
+      if (b) {
+        const nb = new Map(buckets)
+        nb.set(e.chatId, { ...b, hasMore: e.hasMore })
+        set({ buckets: nb })
+      }
+      break
+    }
     case 'sync_progress': {
-      patch({ syncing: { chats: e.chats, contacts: e.contacts, messages: e.messages } })
+      patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
       break
     }
     case 'bridge_error': {

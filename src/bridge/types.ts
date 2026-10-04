@@ -135,7 +135,8 @@ export type ServerEvent =
   | { type: 'qr'; qr: string }
   | { type: 'connection'; state: 'open' | 'closed' }
   | { type: 'history_done' }
-  | { type: 'sync_progress'; chats: number; contacts: number; messages: number }
+  | { type: 'older_result'; chatId: Id; count: number; hasMore: boolean }
+  | { type: 'sync_progress'; chats: number; contacts: number; messages: number; progress?: number | null; done?: boolean }
   /** a command failed at the bridge — the UI surfaces it as a toast */
   | { type: 'bridge_error'; message: string }
 

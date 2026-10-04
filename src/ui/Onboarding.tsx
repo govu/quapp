@@ -73,7 +73,7 @@ export function Onboarding() {
     status === 'error'
       ? { text: 'Cannot reach the Quapp bridge', tone: 'error' as const }
       : syncing
-        ? { text: `Syncing — ${syncing.chats} chats, ${syncing.messages.toLocaleString()} messages…`, tone: 'idle' as const }
+        ? { text: `Syncing${syncing.progress != null ? ` ${syncing.progress}%` : ''} — ${syncing.chats} chats, ${syncing.messages.toLocaleString()} messages…`, tone: 'idle' as const }
         : scanned
           ? { text: 'Connected! Loading your chats…', tone: 'idle' as const }
           : qr
