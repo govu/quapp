@@ -663,10 +663,12 @@ function storeRaw(raw, model) {
   }
   const chat = chatOf(model.chatId)
   if (chat) chat.lastActivity = Math.max(chat.lastActivity, model.ts)
-  // live media lands warm: a photo arriving while we're online downloads to
-  // cache immediately so the bubble never shows a spinner
-  if (S.open && S.historyDone && ['image', 'video', 'sticker', 'audio', 'document'].includes(model.content?.kind)) {
-    void mediaBuffer(model.chatId, model.id).catch(() => {})
+  // a fresh proto carries new signed URLs — unmark any earlier dead-media verdict
+  if (['image', 'video', 'sticker', 'audio', 'document'].includes(model.content?.kind)) {
+    mediaDead.delete(model.chatId + ':' + model.id)
+    // live media lands warm: a photo arriving while we're online downloads to
+    // cache immediately so the bubble never shows a spinner
+    if (S.open && S.historyDone) void mediaBuffer(model.chatId, model.id).catch(() => {})
   }
   // learn pushNames from messages — the only name source for @lid contacts
   const sender = canonicalJid(norm(raw.key?.participant ?? raw.key?.remoteJid ?? ''))
@@ -1050,7 +1052,10 @@ function onHistory({ chats, contacts, messages, syncType, isLatest, progress, pe
 
 // background media warmup — the phone's CDN links are freshest right after
 // history replay, so pull the newest media of the most recent chats into the
-// disk cache at low pace; the UI's <img> then hits a warm cache instantly
+// disk cache at low pace; the UI's <img> then hits a warm cache instantly.
+// Skips: files already cached, media we permanently failed before, and rows
+// older than MEDIA_PREFETCH_AGE — CDN links that old are dead anyway
+const MEDIA_PREFETCH_AGE = 21 * 24 * 3600 * 1000
 let prefetchRunning = false
 async function prefetchMedia() {
   if (prefetchRunning) return
@@ -1058,12 +1063,16 @@ async function prefetchMedia() {
   try {
     const chats = [...S.chats.values()].sort((a, b) => b.lastActivity - a.lastActivity).slice(0, 40)
     const queue = []
+    const cutoff = Date.now() - MEDIA_PREFETCH_AGE
     for (const c of chats) {
       const b = msgsOf(c.id)
       for (const id of [...b.keys()].slice(-25)) {
         const e = b.get(id)
         const k = e?.model?.content?.kind
-        if (!['image', 'video', 'sticker', 'document', 'audio'].includes(k)) continue
+        if (!e || !['image', 'video', 'sticker', 'document', 'audio'].includes(k)) continue
+        if (e.model.ts < cutoff) continue
+        const key = c.id + ':' + id
+        if (mediaDead.has(key)) continue
         const cache = path.join(MEDIA_DIR, enc(c.id) + '--' + enc(id))
         if (!fs.existsSync(cache)) queue.push([c.id, id])
       }
@@ -1872,9 +1881,16 @@ function mediaFileName(protoMsg) {
   const c = inner[t] ?? {}
   return c.fileName ?? c.caption?.slice(0, 40) ?? null
 }
+// mediaDead marks messages whose download is permanently exhausted (dead CDN +
+// declined/failed phone re-upload). Retrying costs a 45s reupload wait — a
+// fresh proto arriving via history replay clears the mark (new signed URLs)
+const mediaDead = new Set()
+
 async function mediaBuffer(chatId, messageId) {
   const entry = msgsOf(chatId).get(messageId)
   if (!entry) return null
+  const deadKey = chatId + ':' + messageId
+  if (mediaDead.has(deadKey)) return 'gone'
   const cache = path.join(MEDIA_DIR, enc(chatId) + '--' + enc(messageId))
   try {
     if (fs.existsSync(cache)) return fs.readFileSync(cache)
@@ -1895,8 +1911,9 @@ async function mediaBuffer(chatId, messageId) {
     const msg = e?.message ?? ''
     // 'No valid media URL' = view-once consumed elsewhere / media genuinely
     // gone — 410 Gone so the UI can render 'unavailable' instead of retrying
-    if (/No valid media URL/i.test(msg)) { log('media gone (view-once/redacted):', messageId); return 'gone' }
+    if (/No valid media URL/i.test(msg)) { log('media gone (view-once/redacted):', messageId); mediaDead.add(deadKey); return 'gone' }
     log('media download failed:', msg)
+    mediaDead.add(deadKey)
     return null
   }
 }
