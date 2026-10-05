@@ -62,7 +62,7 @@ export interface LinkPreview {
 }
 
 export type MsgContent =
-  | { kind: 'text'; text: string; linkPreview?: LinkPreview }
+  | { kind: 'text'; text: string; linkPreview?: LinkPreview; bg?: number }
   | { kind: 'image'; url: string; poster?: string; w: number; h: number; caption?: string }
   | { kind: 'video'; url: string; poster?: string; w: number; h: number; caption?: string; duration: number; round?: boolean }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: boolean; played?: boolean; url?: string; file?: string }
@@ -124,6 +124,18 @@ export interface MessagePage {
   hasMore: boolean
 }
 
+/** one contact's status ring — live (<24h) messages and the unseen count */
+export interface StatusUpdate {
+  jid: Id
+  mine?: boolean
+  name: string
+  avatarHue: number
+  avatarUrl?: string
+  msgs: Message[]
+  unseen: number
+  latest: number
+}
+
 export interface SearchHit {
   messageId: Id
   chatId: Id
@@ -144,7 +156,7 @@ export interface ProfileInfo {
 }
 
 export type OutContent =
-  | { kind: 'text'; text: string }
+  | { kind: 'text'; text: string; bg?: number }
   | { kind: 'audio'; duration: number; waveform: number[]; voice: true; url?: string; dataUrl?: string }
   | { kind: 'document'; name: string; size: number; mime: string; url?: string; dataUrl?: string }
   | { kind: 'image'; url: string; poster?: string; w: number; h: number; caption?: string }
@@ -172,6 +184,8 @@ export type ServerEvent =
   | { type: 'sync_progress'; chats: number; contacts: number; messages: number; progress?: number | null; done?: boolean }
   | { type: 'profile'; profile: ProfileInfo }
   | { type: 'call'; call: CallInfo }
+  /** a contact posted/updated statuses — status:null means theirs expired */
+  | { type: 'status_update'; jid?: Id; status: StatusUpdate | null }
   /** a command failed at the bridge — the UI surfaces it as a toast */
   | { type: 'bridge_error'; message: string }
 
@@ -184,6 +198,8 @@ export interface Snapshot {
   contacts: Contact[]
   /** initial pages for the most recent chats, keyed by chat id */
   topMessages: Record<Id, Message[]>
+  /** live status rings (<24h), keyed by sender jid — 'me' for ours */
+  statuses?: StatusUpdate[]
 }
 
 export interface ClientAdapter {
@@ -237,6 +253,14 @@ export interface ClientAdapter {
   createGroup?(subject: string, participantJids: Id[]): Promise<{ chatId?: Id; error?: string }>
   /** decline a ringing call — real protocol action */
   rejectCall?(callId: string, callFrom: Id): Promise<void>
+  /** post a status (text/image/video) to status@broadcast */
+  sendStatus?(content: OutContent): Promise<void> | void
+  /** clear a contact's unseen-status ring after viewing */
+  markStatusSeen?(jid: Id): void
+  /** our WhatsApp profile: display name and/or about text */
+  setProfile?(p: { name?: string; status?: string }): Promise<void>
+  /** group invite code — the UI builds the chat.whatsapp.com link */
+  groupInvite?(chatId: Id): Promise<{ code?: string }>
   storageStats?(): Promise<{ bytes: number; files: number }>
   clearCache?(): Promise<number>
   onEvent(cb: (e: ServerEvent) => void): () => void

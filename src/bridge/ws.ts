@@ -175,6 +175,14 @@ export class WsAdapter implements ClientAdapter {
     return this.call<{ chatId?: Id; error?: string }>('createGroup', { subject, participantJids })
   }
   rejectCall(callId: string, callFrom: Id) { return this.call<void>('rejectCall', { callId, callFrom }) }
+  sendStatus(content: OutContent) {
+    return this.call<unknown>('sendStatus', { content }).then(() => undefined, (e) => { this.errToast(e); throw e })
+  }
+  markStatusSeen(jid: Id) { this.sendCmd('statusSeen', { jid }) }
+  setProfile(p: { name?: string; status?: string }) {
+    return this.call<void>('setProfile', p).then(() => undefined, (e) => { this.errToast(e); throw e })
+  }
+  groupInvite(chatId: Id) { return this.call<{ code?: string }>('groupInvite', { chatId }) }
   download(chatId: Id, messageId: Id) {
     return this.call<{ path?: string; error?: string }>('download', { chatId, messageId })
   }

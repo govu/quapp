@@ -88,6 +88,14 @@ interface State {
   groupSheet: boolean
   /** a live incoming call — set on 'offer', cleared on terminate/timeout */
   incomingCall: CallInfo | null
+  /** status rings by sender jid ('me' = ours) — live <24h */
+  statuses: Map<Id, import('./bridge/types').StatusUpdate>
+  /** sidebar shows the status list instead of chats */
+  statusOpen: boolean
+  /** full-screen status viewer — sender + current index */
+  statusView: { jid: Id; index: number } | null
+  /** status composer sheet */
+  statusCompose: boolean
 }
 
 let toastId = 0
@@ -174,6 +182,10 @@ export const useStore = create<State>(() => ({
   starredList: null,
   groupSheet: false,
   incomingCall: null,
+  statuses: new Map(),
+  statusOpen: false,
+  statusView: null,
+  statusCompose: false,
   settings: loadSettings(),
 }))
 
@@ -290,6 +302,7 @@ function flushEvents() {
   const online = new Map(s.online)
   const contacts = new Map(s.contacts)
   const profiles = new Map(s.profiles)
+  const statuses = new Map(s.statuses)
   const settings = s.settings
   const activeChat = s.activeChat
   let chatsTouched = false
@@ -298,6 +311,7 @@ function flushEvents() {
   let onlineTouched = false
   let contactsTouched = false
   let profilesTouched = false
+  let statusesTouched = false
   let activeTouched: Id | null | undefined
 
   // lazily-cloned per-chat message maps — each chat's map clones at most once
@@ -489,6 +503,12 @@ function flushEvents() {
         patch({ syncing: e.done ? null : { chats: e.chats, contacts: e.contacts, messages: e.messages, progress: e.progress ?? undefined } })
         break
       }
+      case 'status_update': {
+        if (e.status) statuses.set(e.status.jid, e.status)
+        else if (e.jid) statuses.delete(e.jid)
+        statusesTouched = true
+        break
+      }
       case 'call': {
         const c = e.call
         if (c.status === 'offer' && !c.offline) {
@@ -541,6 +561,7 @@ function flushEvents() {
   if (onlineTouched) next.online = online
   if (contactsTouched) next.contacts = contacts
   if (profilesTouched) next.profiles = profiles
+  if (statusesTouched) next.statuses = statuses
   if (activeTouched !== undefined) next.activeChat = activeTouched
   if (Object.keys(next).length) set(next)
 }
@@ -622,8 +643,9 @@ export async function boot(adapter: ClientAdapter) {
   // auto-select the top chat only on the first successful boot — a resync
   // must not yank the user out of "no chat open" or switch their chat
   const first = current && chats.has(current) ? current : wasLinking ? (order[0] ?? null) : null
+  const statuses = new Map((snap.statuses ?? []).map((g) => [g.jid, g]))
   patch({
-    phase: 'ready', account: snap.account, chats, order, buckets, contacts,
+    phase: 'ready', account: snap.account, chats, order, buckets, contacts, statuses,
     activeChat: first, bridgeStatus: 'ready', qrString: null,
     openUnread: first ? (chats.get(first)?.unread ?? 0) : 0,
   })
@@ -740,8 +762,9 @@ function optimisticContent(c: OutContent): MsgContent {
   }
 }
 
-export function send(chatId: Id, content: OutContent) {
-  const { adapter, replyTo } = get()
+export function send(chatId: Id, content: OutContent, replyOverride?: ReplyRef) {
+  const { adapter } = get()
+  const replyTo = replyOverride ?? get().replyTo
   const id = newMsgId()
   // optimistic insert — the daemon's echo arrives under the same id and
   // upgrades this row; a failure lands as delivery:'failed'
@@ -790,6 +813,55 @@ export function sendFile(chatId: Id, f: File, forceDoc = false) {
     img.src = url
   }
   rd.readAsDataURL(f)
+}
+
+// ---------- statuses ----------
+
+export function setStatusOpen(v: boolean) { patch({ statusOpen: v }) }
+export function setStatusCompose(v: boolean) { patch({ statusCompose: v }) }
+
+export function openStatus(jid: Id, index = 0) {
+  patch({ statusView: { jid, index } })
+  if (jid !== 'me') get().adapter?.markStatusSeen?.(jid)
+}
+
+export function closeStatus() { patch({ statusView: null }) }
+
+/** next/prev message inside the ring, then across senders like WhatsApp */
+export function stepStatus(dir: 1 | -1) {
+  const { statusView, statuses } = get()
+  if (!statusView) return
+  const g = statuses.get(statusView.jid)
+  if (!g) { closeStatus(); return }
+  const next = statusView.index + dir
+  if (next >= 0 && next < g.msgs.length) { patch({ statusView: { ...statusView, index: next } }); return }
+  const list = [...statuses.values()].sort((a, b) => b.latest - a.latest)
+  const i = list.findIndex((x) => x.jid === statusView.jid)
+  const ns = list[i + dir]
+  if (!ns) { closeStatus(); return }
+  patch({ statusView: { jid: ns.jid, index: dir === 1 ? 0 : ns.msgs.length - 1 } })
+  if (ns.jid !== 'me') get().adapter?.markStatusSeen?.(ns.jid)
+}
+
+export async function postStatus(content: OutContent) {
+  try {
+    await get().adapter?.sendStatus?.(content)
+    patch({ statusCompose: false })
+  } catch {
+    toast("Couldn't post status — try again", 'error')
+  }
+}
+
+/** name/about mirrored to WhatsApp through the bridge */
+export async function saveProfile(p: { name?: string; status?: string }) {
+  try {
+    await get().adapter?.setProfile?.(p)
+    const acc = get().account
+    if (p.name && acc) patch({ account: { ...acc, name: p.name } })
+    toast('Profile updated', 'check')
+  } catch {
+    toast("Couldn't update profile — try again", 'error')
+  }
 }
 
 export function setReplyTo(r: ReplyRef | null) { patch({ replyTo: r, editing: null }) }

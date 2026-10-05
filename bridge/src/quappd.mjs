@@ -152,6 +152,11 @@ let stateTimer = null
 // phone-side PDO silence — persisted so a restart doesn't re-burn the budget
 let pdoSilentUntil = 0
 let pdoPauseStreak = 0
+// statuses (status@broadcast) — filed by sender, 24h expiry like WhatsApp.
+// statusSeen: senderJid -> last-viewed ts, drives the unseen ring per contact
+const STATUS_JID = 'status@broadcast'
+const STATUS_TTL = 24 * 3600 * 1000
+const statusSeen = new Map()
 const markDirty = () => {
   stateDirty = true
   if (stateTimer) return
@@ -184,6 +189,7 @@ function writeState() {
       msgs,
       pdoSilentUntil,
       pdoPauseStreak,
+      statusSeen: [...statusSeen],
     }
     const tmp = STATE_FILE + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(st))
@@ -204,6 +210,7 @@ try {
   // ignoring us, which resets its cooldown clock forever
   pdoSilentUntil = st.pdoSilentUntil ?? 0
   pdoPauseStreak = st.pdoPauseStreak ?? 0
+  for (const [k, v] of st.statusSeen ?? []) statusSeen.set(k, v)
   // drop phantom chats/messages persisted before the badJid guard existed
   for (const k of [...S.chats.keys()]) if (badJid(k)) { S.chats.delete(k); S.msgs.delete(k) }
   for (const [cid, arr] of Object.entries(st.msgs ?? {})) {
@@ -566,6 +573,7 @@ function convertContent(chatId, id, inner) {
     case 'extendedTextMessage': {
       const out = { kind: 'text', text: c.text ?? '' }
       if (c.title && c.matchedText) out.linkPreview = { url: c.matchedText, title: c.title, description: c.description }
+      if (c.backgroundColor) out.bg = c.backgroundColor // status text bg (argb)
       return out
     }
     case 'imageMessage': {
@@ -853,6 +861,58 @@ function storeRaw(raw, model) {
       S.lastKey.set(model.chatId, { key: raw.key, messageTimestamp: Number(raw.messageTimestamp ?? 0) })
     }
   }
+  // a status@broadcast row files under the broadcast bucket (no chat — badJid
+  // drops it) and surfaces to the UI as a status update for its SENDER
+  if (model.chatId === STATUS_JID) {
+    const sender = raw.key?.fromMe ? 'me' : canonicalJid(norm(raw.key?.participant ?? ''))
+    if (sender) emit({ type: 'status_update', jid: sender, status: statusGroup(sender) })
+  }
+}
+
+// one contact's status ring: live (<24h) msgs + the unseen count
+function statusGroup(sender) {
+  const bucket = S.msgs.get(STATUS_JID)
+  const cutoff = Date.now() - STATUS_TTL
+  const msgs = []
+  if (bucket) {
+    for (const e of bucket.values()) {
+      const s = e.proto?.key?.fromMe ? 'me' : canonicalJid(norm(e.proto?.key?.participant ?? ''))
+      if (s === sender && e.model.ts >= cutoff) msgs.push(e.model)
+    }
+  }
+  msgs.sort((a, b) => a.ts - b.ts)
+  if (!msgs.length) return null
+  const mine = sender === 'me'
+  const c = mine ? null : S.contacts.get(sender)
+  const seenTs = statusSeen.get(sender) ?? 0
+  return {
+    jid: sender,
+    mine,
+    name: mine ? 'My status' : (c?.name ?? displayName(sender)),
+    avatarHue: hue(mine ? (S.me?.id ?? 'me') : sender),
+    avatarUrl: `http://${HOST}:${MEDIA_PORT}/a/${encodeURIComponent(mine ? (S.me?.id ?? 'me') : sender)}?token=${TOKEN}`,
+    msgs,
+    unseen: msgs.filter((m) => m.ts > seenTs).length,
+    latest: msgs[msgs.length - 1].ts,
+  }
+}
+
+function statusList() {
+  const bucket = S.msgs.get(STATUS_JID)
+  if (!bucket?.size) return []
+  const senders = new Set()
+  const cutoff = Date.now() - STATUS_TTL
+  const pruneCut = Date.now() - STATUS_TTL - 3600 * 1000
+  let pruned = false
+  for (const [id, e] of bucket) {
+    if (e.model.ts < pruneCut) { bucket.delete(id); pruned = true; continue }
+    if (e.model.ts < cutoff) continue
+    senders.add(e.proto?.key?.fromMe ? 'me' : canonicalJid(norm(e.proto?.key?.participant ?? '')))
+  }
+  if (pruned) markDirty()
+  const out = []
+  for (const s of senders) { const g = s && statusGroup(s); if (g) out.push(g) }
+  return out.sort((a, b) => b.latest - a.latest)
 }
 
 // ---------- socket ----------
@@ -1110,6 +1170,9 @@ function onConn({ connection, lastDisconnect, qr }) {
           ...emptyChats.slice(0, 20),
           ...[...S.contacts.keys()].filter((j) => (j.endsWith('@s.whatsapp.net') || j.endsWith('@lid')) && !known.has(j)).slice(0, 20),
         ]
+        // one tail probe for statuses LAST — status@broadcast history isn't in
+        // the regular sync; if the phone answers we backfill the 24h of rings
+        if (!msgsOf(STATUS_JID).size) candidates.push(STATUS_JID)
         log(`contact discovery: ${candidates.length} candidates (${emptyChats.length} empty, ${staleChats.length} stale)`)
         if (!candidates.length) return
         let i = 0
@@ -1379,7 +1442,9 @@ function onMessages({ messages, type }) {
   for (const raw of messages) {
     learnFromKey(raw.key)
     const jid = canonicalJid(norm(raw.key?.remoteJid))
-    if (badJid(jid)) continue
+    // broadcast is badJid EXCEPT status@broadcast — statuses file under the
+    // broadcast bucket (no chat row) and surface in the Status pane
+    if (badJid(jid) && jid !== STATUS_JID) continue
     const inner = extractMessageContent(raw.message)
     const t = inner && getContentType(inner)
 
@@ -1790,6 +1855,7 @@ function snapshot() {
     chats,
     contacts: [...S.contacts.values()],
     topMessages,
+    statuses: statusList(),
   }
 }
 const waitReady = () =>
@@ -1886,7 +1952,8 @@ const CMDS = {
     const opts = {}
     if (clientId) opts.messageId = clientId // echo reconciles the optimistic row
     if (replyTo) {
-      const quoted = msgsOf(chatId).get(replyTo.id)?.proto
+      // status replies quote a status@broadcast proto, not a DM message
+      const quoted = msgsOf(chatId).get(replyTo.id)?.proto ?? msgsOf(STATUS_JID).get(replyTo.id)?.proto
       if (quoted) opts.quoted = quoted
     }
     let sent
@@ -2227,6 +2294,48 @@ const CMDS = {
     if (!subject?.trim() || !jids.length) return { error: 'need a subject and members' }
     const res = await S.sock.groupCreate(subject.trim().slice(0, 100), jids)
     return { chatId: res?.gid ?? null }
+  },
+
+  // post a status — real protocol: status@broadcast + the audience list the
+  // phone requires (our contacts; own jid included so our devices see it too)
+  async sendStatus({ content }) {
+    const payload = await outPayload(content)
+    if (!payload) return { error: 'unsupported content' }
+    // text statuses carry the chosen field color (extendedTextMessage bg, argb)
+    if (content?.kind === 'text' && content.bg) payload.backgroundColor = content.bg
+    const audience = new Set()
+    for (const j of S.contacts.keys()) if (j.endsWith('@s.whatsapp.net')) audience.add(j)
+    for (const j of S.chats.keys()) if (j.endsWith('@s.whatsapp.net')) audience.add(j)
+    if (S.me?.id) audience.add(jidNormalizedUser(S.me.id))
+    const sent = await S.sock.sendMessage(STATUS_JID, payload, { statusJidList: [...audience] })
+    if (sent) {
+      const model = toModel(sent) ?? baseModel(sent, STATUS_JID, { kind: 'text', text: '' })
+      storeRaw(sent, model) // files under the broadcast bucket + emits status_update
+      emit({ type: 'status_update', jid: 'me', status: statusGroup('me') })
+    }
+    return { ok: true }
+  },
+
+  // the user finished viewing a contact's statuses — clear the unseen ring
+  async statusSeen({ jid }) {
+    const j = jid === 'me' ? 'me' : canonicalJid(norm(jid))
+    statusSeen.set(j, Date.now())
+    markDirty()
+    emit({ type: 'status_update', jid: j, status: statusGroup(j) })
+    return { ok: true }
+  },
+
+  // profile name + about — mirrored to WhatsApp via the account paths
+  async setProfile({ name, status: about }) {
+    if (name) await S.sock.updateProfileName(name)
+    if (about) await S.sock.updateProfileStatus(about)
+    if (name && S.me) { S.me.name = name; markDirty(); emit({ type: 'linked', account: { id: S.me.id, name: S.me.name, phone: S.me.phone } }) }
+    return { ok: true }
+  },
+
+  async groupInvite({ chatId }) {
+    const code = await S.sock.groupInviteCode(norm(chatId))
+    return { code }
   },
 
   async rejectCall({ callId, callFrom }) {

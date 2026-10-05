@@ -4,7 +4,7 @@ import {
   Bell, ChatCircle, Database, Info, Keyboard, Lock, PaintBrush, User, X,
 } from '@phosphor-icons/react'
 import { cx, spring } from '../lib/util'
-import { logout, setSettingsOpen, toast, updateSettings, useStore, type Accent, type Settings } from '../store'
+import { logout, saveProfile, setSettingsOpen, toast, updateSettings, useStore, type Accent, type Settings } from '../store'
 import { Avatar, Dialog, DialogButton, SquircleIcon } from './common'
 
 type SectionId = 'account' | 'appearance' | 'chats' | 'notifications' | 'privacy' | 'storage' | 'shortcuts' | 'about'
@@ -165,9 +165,27 @@ function Segmented<T extends string>({ options, value, onChange }: { options: { 
 
 function AccountSection() {
   const account = useStore((s) => s.account)
+  const adapter = useStore((s) => s.adapter)
   const demoMode = useStore((s) => s.demoMode)
   const [dialog, setDialog] = useState<'devices' | 'add' | 'logout' | null>(null)
+  const [editing, setEditing] = useState<'name' | 'about' | null>(null)
+  const [draft, setDraft] = useState('')
+  const [about, setAbout] = useState<string | null>(null)
   const relink = () => { setDialog(null); logout() }
+  // our about text comes from the same profile fetch the info pane uses
+  useEffect(() => {
+    if (!account?.id || demoMode) return
+    void adapter?.profile?.(account.id).then((p) => {
+      if (p && 'about' in p && p.about) setAbout(p.about)
+    }).catch(() => {})
+  }, [account?.id, adapter, demoMode])
+  const commit = () => {
+    const v = draft.trim()
+    if (!v) { setEditing(null); return }
+    if (editing === 'name') void saveProfile({ name: v })
+    if (editing === 'about') { void saveProfile({ status: v }); setAbout(v) }
+    setEditing(null)
+  }
   return (
     <div>
       <SectionTitle>Account</SectionTitle>
@@ -179,6 +197,31 @@ function AccountSection() {
             <div className="text-[13px] text-[var(--label-2)]">{account?.phone}</div>
           </div>
         </div>
+      </Group>
+      <Group>
+        <button className="block w-full text-left" onClick={() => { setEditing('name'); setDraft(account?.name ?? '') }}>
+          <Row label="Name" hint={editing === 'name' ? undefined : 'Shown to your contacts'} control={editing === 'name' ? (
+            <input
+              autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(null) }}
+              onBlur={commit}
+              className="quiet-input w-40 rounded-[7px] bg-[var(--fill-3)] px-2 py-1 text-[13px] text-right"
+            />
+          ) : <span className="text-[13px] text-[var(--label-3)]">{account?.name}</span>} />
+        </button>
+        <button className="block w-full text-left" onClick={() => { setEditing('about'); setDraft(about ?? '') }}>
+          <Row label="About" hint={editing === 'about' ? undefined : undefined} control={editing === 'about' ? (
+            <input
+              autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(null) }}
+              onBlur={commit}
+              placeholder="Hey there! I am using Quapp."
+              className="quiet-input w-44 rounded-[7px] bg-[var(--fill-3)] px-2 py-1 text-[13px] text-right"
+            />
+          ) : <span className="max-w-[200px] truncate text-[13px] text-[var(--label-3)]">{about ?? 'Hey there! I am using WhatsApp.'}</span>} />
+        </button>
       </Group>
       <Group>
         <button className="block w-full text-left" onClick={() => setDialog('devices')}>

@@ -2,12 +2,12 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion } from 'motion/react'
 import {
-  Archive, Bell, BellSlash, CaretDown, CaretUp, MagnifyingGlass, Phone, Prohibit, PushPin, Star, Trash, VideoCamera, X,
+  Archive, Bell, BellSlash, CaretDown, CaretUp, Link as LinkIcon, MagnifyingGlass, Phone, Prohibit, PushPin, Star, Trash, VideoCamera, X,
 } from '@phosphor-icons/react'
 import type { Chat, Message } from '../bridge/types'
 import { cx, formatPhone, highlight, spring, timeLabel } from '../lib/util'
 import {
-  doCallHandoff, doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doRejectCall, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, useStore,
+  doCallHandoff, doCreateGroup, doDownload, doFlag, doForward, doLeaveGroup, doRejectCall, doStar, jumpTo, loadStarred, requestProfile, searchInChat, setGroupSheet, setPane, toast, useStore,
 } from '../store'
 import { Avatar, Dialog, DialogButton } from './common'
 import { previewOf } from './Bubble'
@@ -398,6 +398,18 @@ export const InfoPane = memo(function InfoPane({ chat }: { chat: Chat }) {
                 onClick={() => {
                   void useStore.getState().adapter?.block?.(chat.id, !blocked)
                   setBlocked(!blocked)
+                }}
+              />
+            )}
+            {chat.kind === 'group' && (
+              <InfoRow
+                icon={<LinkIcon size={17} />}
+                label="Copy invite link"
+                onClick={() => {
+                  void useStore.getState().adapter?.groupInvite?.(chat.id).then((r) => {
+                    if (r?.code) { void navigator.clipboard.writeText(`https://chat.whatsapp.com/${r.code}`); toast('Invite link copied', 'check') }
+                    else toast('No invite link available', 'error')
+                  }).catch(() => toast('Could not get invite link', 'error'))
                 }}
               />
             )}

@@ -2,16 +2,17 @@ import { memo, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'motion/react'
 import {
-  Archive, BellSlash, Checks, Check, Clock, Gear, MagnifyingGlass, PencilSimple,
+  Archive, BellSlash, Checks, Check, CircleDashed, Clock, Gear, MagnifyingGlass, PencilSimple,
   PushPin, Plus, Trash, Users, Star, ArrowLeft, X,
 } from '@phosphor-icons/react'
 import type { Chat, Id } from '../bridge/types'
 import { cx, formatPhone, highlight, listTime } from '../lib/util'
 import {
   confirmClearChat, confirmDeleteChat, doFlag, doMarkRead, doMarkUnread, openChat, setFilter, setPalette, setPane, setQuery, setRelinkPrompt,
-  setGroupSheet, setSettingsOpen, setShowArchived, useStore, type Filter,
+  setGroupSheet, setSettingsOpen, setShowArchived, setStatusOpen, useStore, type Filter,
 } from '../store'
 import { Avatar } from './common'
+import { StatusPane } from './Status'
 import { showContextMenu } from './Menu'
 
 const FILTERS: { id: Filter; label: string }[] = [
@@ -166,6 +167,8 @@ export function Sidebar() {
   const syncing = useStore((s) => s.syncing)
   const bridgeStatus = useStore((s) => s.bridgeStatus)
   const demoMode = useStore((s) => s.demoMode)
+  const statusOpen = useStore((s) => s.statusOpen)
+  const statusUnseen = useStore((s) => [...s.statuses.values()].reduce((n, g) => n + g.unseen, 0))
   const scrollRef = useRef<HTMLDivElement>(null)
   const [accountOpen, setAccountOpen] = useState(false)
 
@@ -267,6 +270,18 @@ export function Sidebar() {
         </div>
         <div className="flex-1" />
         <button
+          className="press focus-ring no-drag relative grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
+          onClick={() => setStatusOpen(true)}
+          aria-label="Status"
+        >
+          <CircleDashed size={19} />
+          {statusUnseen > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 grid min-w-[16px] place-items-center rounded-full bg-[var(--green)] px-1 text-[10px] font-bold leading-[16px] text-white ring-2 ring-[var(--dot-ring)]">
+              {statusUnseen}
+            </span>
+          )}
+        </button>
+        <button
           className="press focus-ring no-drag grid size-8 place-items-center rounded-full text-[var(--label-2)] hover:bg-[var(--fill-2)]"
           onClick={() => setPalette(true)}
           aria-label="New chat"
@@ -282,7 +297,8 @@ export function Sidebar() {
         </button>
       </div>
 
-      {/* search */}
+      {/* search — chats only; the status list has its own header */}
+      {!statusOpen && (
       <div className="no-drag px-3 pb-2 pt-1">
         <div className="flex items-center gap-2 rounded-[10px] bg-[var(--fill-3)] px-2.5 py-[6px] focus-within:bg-[var(--fill-2)] focus-within:ring-2 focus-within:ring-[var(--blue)]/60">
           <MagnifyingGlass size={15} className="shrink-0 text-[var(--label-3)]" />
@@ -302,6 +318,7 @@ export function Sidebar() {
           <kbd className="hidden shrink-0 text-[11px] text-[var(--label-3)] md:block">Ctrl+K</kbd>
         </div>
       </div>
+      )}
 
       {/* bridge status — the only visible signal when the daemon/WA socket
           drops mid-session; without it the app looks live while dead */}
@@ -313,7 +330,7 @@ export function Sidebar() {
       )}
 
       {/* filter chips */}
-      {!showArchived && (
+      {!showArchived && !statusOpen && (
       <div className="flex gap-1.5 overflow-x-auto px-3 pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {FILTERS.map((f) => {
           const active = filter === f.id && !showArchived
@@ -347,7 +364,7 @@ export function Sidebar() {
       )}
 
       {/* archived row */}
-      {!showArchived && archivedCount > 0 && !query && (
+      {!showArchived && archivedCount > 0 && !query && !statusOpen && (
         <button
           onClick={() => setShowArchived(true)}
           className="mx-2 mb-1 flex items-center gap-3 rounded-[10px] px-2 py-2 text-left hover:bg-[var(--row-hover)]"
@@ -360,14 +377,17 @@ export function Sidebar() {
         </button>
       )}
 
-      {showArchived && (
+      {showArchived && !statusOpen && (
         <button onClick={() => setShowArchived(false)} className="mx-2 mb-1 flex items-center gap-3 rounded-[10px] px-2 py-2 hover:bg-[var(--row-hover)]">
           <ArrowLeft size={18} className="text-[var(--blue)]" />
           <span className="text-[15px] font-semibold">Archived</span>
         </button>
       )}
 
-      {/* chat list — virtualized */}
+      {statusOpen ? (
+        <StatusPane />
+      ) : (
+      /* chat list — virtualized */
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto pb-2" role="listbox" aria-label="Conversations">
         {visible.length === 0 ? (
           <div className="grid h-full place-items-center px-6 text-center">
@@ -397,6 +417,7 @@ export function Sidebar() {
           </div>
         )}
       </div>
+      )}
     </aside>
   )
 }

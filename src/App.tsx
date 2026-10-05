@@ -2,7 +2,7 @@ import { Suspense, lazy, useEffect, useState } from 'react'
 import { AnimatePresence, MotionConfig } from 'motion/react'
 import { WsAdapter } from './bridge/ws'
 import type { ClientAdapter } from './bridge/types'
-import { boot, clearSelection, closeConfirm, logout, nextChat, setForwarding, setGroupSheet, setPalette, setPane, setRelinkPrompt, setSettingsOpen, useStore } from './store'
+import { boot, clearSelection, closeConfirm, closeStatus, logout, nextChat, setForwarding, setGroupSheet, setPalette, setPane, setRelinkPrompt, setSettingsOpen, setStatusCompose, useStore } from './store'
 import { Sidebar } from './ui/Sidebar'
 import { Conversation } from './ui/Conversation'
 import { Onboarding } from './ui/Onboarding'
@@ -10,6 +10,7 @@ import { Palette } from './ui/Palette'
 import { Dialog, DialogButton, Toasts } from './ui/common'
 import { ContextMenuHost } from './ui/Menu'
 import { CallOverlay, ForwardSheet, GroupSheet } from './ui/Panes'
+import { StatusComposer, StatusViewer } from './ui/Status'
 
 const SettingsSheet = lazy(() => import('./ui/Settings').then((m) => ({ default: m.SettingsSheet })))
 
@@ -130,6 +131,8 @@ export default function App() {
         const s = useStore.getState()
         if (s.paletteOpen) { setPalette(false); return }
         if (s.confirm) { closeConfirm(); return }
+        if (s.statusView) { closeStatus(); return }
+        if (s.statusCompose) { setStatusCompose(false); return }
         if (s.groupSheet) { setGroupSheet(false); return }
         if (s.forwarding) { setForwarding(null); return }
         if (s.selection) clearSelection()
@@ -163,6 +166,8 @@ export default function App() {
         </Suspense>
         <AnimatePresence>{forwarding && <ForwardSheet />}</AnimatePresence>
         <AnimatePresence>{groupSheet && <GroupSheet />}</AnimatePresence>
+        <AnimatePresence><StatusViewer /></AnimatePresence>
+        <AnimatePresence><StatusComposer /></AnimatePresence>
         <AnimatePresence><CallOverlay /></AnimatePresence>
         <Palette />
         <Toasts />
